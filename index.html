@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      Apply the persisted theme BEFORE first paint so dark-by-default never
+      flashes light. Reads the same localStorage blob settings.jsx writes
+      (`redlogs:settings`) and mirrors its default: dark unless darkMode is
+      explicitly false. settings.jsx re-asserts data-theme after React mounts.
+    -->
+    <script>
+      (function () {
+        try {
+          var raw = localStorage.getItem('redlogs:settings');
+          var s = raw ? JSON.parse(raw) : null;
+          var dark = !s || s.darkMode !== false; // default ON
+          document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+        } catch (e) {
+          document.documentElement.dataset.theme = 'dark';
+        }
+      })();
+    </script>
+    <title>Redlogs — wireframes</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=JetBrains+Mono:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      /*
+        WF palette as CSS custom properties. primitives.jsx's `WF` object holds
+        `var(--wf-*)` references rather than literal hex, so every inline style
+        across the app resolves these live — flipping `data-theme` on <html>
+        re-themes the whole tree with no React re-render and no import-time
+        capture problems. Light values are byte-identical to the original WF.
+      */
+      :root {
+        color-scheme: light;
+        --wf-paper: #fafaf7;
+        --wf-ink: #1a1a1a;
+        --wf-ink2: #4a4a48;
+        --wf-ink3: #8a8a85;
+        --wf-rule: #d4d4d0;
+        --wf-rule2: #bfbfba;
+        --wf-visited: #b5b5ae;
+        --wf-paperAlt: #f2f1ec;
+        --wf-heat0: #f5efec;
+        --wf-heat1: #f6d9d1;
+        --wf-heat2: #f2a694;
+        --wf-heat3: #e06b52;
+        --wf-heat4: #b8321a;
+        /* text that punches out of a filled accent chip — near-white both modes */
+        --wf-onAccent: #fafaf7;
+        /* the auditor's own "user flagged" accent — a clear orange, distinct
+           from the red AI-suspicion heat ramp and the neutral ink chips */
+        --wf-userflag: #e07b1a;
+        /* "+adds" diff count (foreground green); paired with --wf-heat4 dels */
+        --wf-add: #1c5a25;
+        /* faint warm highlight behind an active suspicion item */
+        --wf-tint: #fffaf8;
+        /* element-edge stroke (inkBorder) and the hard offset drop-shadow. In
+           light these equal --wf-ink (unchanged look); in dark they're softened
+           so panel edges/shadows don't glare near-white. */
+        --wf-border: #1a1a1a;
+        --wf-shadow: #1a1a1a;
+        /* warm row/lift highlights + the cool annotation ("what's being done")
+           panel + per-flag row tints — the dossier surfaces that were unthemed. */
+        --wf-mark: #fff7f3;
+        --wf-panel: #f7f9fc;
+        --wf-row-high: #ffe8e3;
+        --wf-row-med: #fff0ec;
+        /* tag/chip families: a subtle -bg fill + a readable -fg label, keyed by
+           hue. Drive KIND/FILECLASS/FLAG/ACTIVITY styles + diff line backgrounds.
+           Light = the original literals; dark = muted fill + bright label. */
+        --wf-tag-green-bg: #e3efe3;  --wf-tag-green-fg: #1c5a25;
+        --wf-tag-amber-bg: #fff5d6;  --wf-tag-amber-fg: #7a5a00;
+        --wf-tag-red-bg: #f6d9d1;    --wf-tag-red-fg: #8a1f1f;
+        --wf-tag-purple-bg: #eae6f4; --wf-tag-purple-fg: #3d2d70;
+        --wf-tag-blue-bg: #dceaf2;   --wf-tag-blue-fg: #1f4d70;
+        --wf-tag-slate-bg: #eceff1;  --wf-tag-slate-fg: #37474f;
+        /* categorical semantic-area accents (THEME_COLOR) */
+        --wf-cat-data: #1e5631;
+        --wf-cat-blue: #1f3d7a;
+        --wf-cat-purple: #4b2e83;
+        --wf-cat-amber: #7a5a00;
+        --wf-cat-slate: #37474f;
+        --wf-cat-bluegrey: #607d8b;
+        /* page backdrop behind the fixed app shell + scrollbar thumb */
+        --wf-page: #e8e6df;
+        --wf-scroll: #bfbfba;
+      }
+      :root[data-theme="dark"] {
+        color-scheme: dark;
+        /* Surfaces sit on a soft charcoal, not near-black — a gentler base than
+           the first pass. Lightness climbs page < paper < paperAlt so the
+           hierarchy still reads. */
+        --wf-paper: #262320;
+        --wf-ink: #e8e7e0;
+        --wf-ink2: #b4b3ac;
+        --wf-ink3: #88877e;
+        --wf-rule: #3a3932;
+        --wf-rule2: #4c4b42;
+        --wf-visited: #5e5d53;
+        --wf-paperAlt: #2f2c25;
+        --wf-heat0: #251f1b;
+        --wf-heat1: #43241c;
+        --wf-heat2: #6d3526;
+        --wf-heat3: #9a4530;
+        --wf-heat4: #c85a3c;
+        --wf-onAccent: #f5f3ee;
+        --wf-userflag: #d98a3c;
+        --wf-add: #5fb86e;
+        --wf-tint: #322620;
+        /* soft mid-grey edges + a near-black drop shadow (reads as a real
+           shadow on dark, not a glowing near-white line) */
+        --wf-border: #4f4e43;
+        --wf-shadow: #0c0b08;
+        --wf-mark: #332d24;
+        --wf-panel: #24272e;
+        --wf-row-high: #3a251d;
+        --wf-row-med: #312521;
+        --wf-tag-green-bg: #1e2c1c;  --wf-tag-green-fg: #74c98a;
+        --wf-tag-amber-bg: #2f2716;  --wf-tag-amber-fg: #cda653;
+        --wf-tag-red-bg: #36211c;    --wf-tag-red-fg: #e08f7e;
+        --wf-tag-purple-bg: #272138; --wf-tag-purple-fg: #b29ae6;
+        --wf-tag-blue-bg: #1c2a36;   --wf-tag-blue-fg: #7bb0df;
+        --wf-tag-slate-bg: #2a2b26;  --wf-tag-slate-fg: #9aabb3;
+        --wf-cat-data: #2f7d4a;
+        --wf-cat-blue: #3f64b0;
+        --wf-cat-purple: #6b4bb0;
+        --wf-cat-amber: #8a6a16;
+        --wf-cat-slate: #4f6b78;
+        --wf-cat-bluegrey: #5a7986;
+        --wf-page: #181610;
+        --wf-scroll: #4c4b42;
+      }
+      html, body { margin: 0; padding: 0; background: var(--wf-page); font-family: "Atkinson Hyperlegible", system-ui, sans-serif; }
+      * { box-sizing: border-box; }
+      .wf-frame *::-webkit-scrollbar { width: 6px; height: 6px; }
+      .wf-frame *::-webkit-scrollbar-thumb { background: var(--wf-scroll); }
+      @keyframes wf-dots {
+        0%, 80%, 100% { opacity: 0.25; transform: translateY(0); }
+        40% { opacity: 1; transform: translateY(-3px); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .wf-dot { animation: none !important; opacity: 0.6 !important; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
