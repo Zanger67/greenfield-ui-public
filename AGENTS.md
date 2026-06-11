@@ -4,7 +4,19 @@ Instructions for a code agent helping a human audit one of these traces.
 
 ## What a trace is
 
-A directory under `public/data/<trace>/`. Two things matter to you:
+A trace is one directory, and it sits in one of two places (the UI treats them
+as peers):
+
+- **Dropped** — `public/data/<trace>/`, a subdirectory carrying `metadata.json`.
+- **Surrounding** — when this repo is self-hosted *inside* a trace's own output
+  folder, the trace's dirs sit one level **up** at `../` (the
+  `dev_with_sample/ui/` → `dev_with_sample/` layout; the `../codebase/` +
+  `../commit_builder_metadata/` marker pair is what signals it).
+
+Paths below are written `public/data/<trace>/…` for brevity; in the surrounding
+case substitute `../…` (so `../codebase/`, `../logs/`,
+`../commit_builder_metadata/`, `../audit/`, and `git -C ../codebase …`). Two
+things matter to you:
 
 - `logs/` — the raw, untouched logs of the agent's session.
 - `codebase/` — a **full git repository** with one commit per event from those
@@ -73,91 +85,178 @@ state to disk as they work (the running dev server writes it on change). It's
 gitignored / outside the repo, so it may be **absent on a fresh clone** — it
 appears once someone opens the trace in the UI.
 
+**If `audit/` is absent or empty — degrade gracefully, don't error or invent.** A
+fresh clone, or a trace nobody has opened in the UI yet, has no audit store at all;
+and even an opened trace has *no record* for an item the auditor never flagged,
+noted, or grouped (a record exists only once one of those happens). So a handed-off
+pointer may not resolve in the overlay. When it doesn't:
+
+- A `commit:<sha>` / `area:<id>` / `thread:<id>` anchor is still fully resolvable —
+  those ids are shared with the AI layer, so go straight to the substrate via the
+  bridge table below: `git -C codebase show <sha>` + `annotations.jsonl` /
+  `suspicions.jsonl` for a commit, `aggregated_suspicions.jsonl` for an area,
+  `thread_annotations.jsonl` for a thread. You lose only the auditor's own
+  notes/flags, not the object itself — investigate it from the sidecar + git.
+- A **user tag-group** anchor (resolved by name) lives *only* in the audit store —
+  it has no AI-sidecar equivalent. If `audit/` is missing, say so plainly rather
+  than guessing: the group can't be resolved because the auditor's working state
+  hasn't been written yet (it's created when the trace is opened in the UI).
+
 These are the **auditor's own** flags, notes, dismissals and groupings — distinct
 from the LLM-produced `commit_builder_metadata/` sidecars above. Treat them as
-**the human's working hints, not ground truth**: they reflect what the auditor
-flagged or wondered about mid-session and may be partial or change. Confirm
-anything important against the logs and the diffs in `codebase/`, same as the AI
-sidecars. Do not hand-edit the `user/` or `status/` files — they're overwritten
-from the live UI on the next change.
+**the human's working hints, not ground truth**: confirm anything important
+against the logs and the diffs in `codebase/`, same as the AI sidecars. Do not
+hand-edit the `items/`, `groups/`, or `status/` files — the UI overwrites them
+from the live state on the next change.
 
 ```
-<trace>/audit/                # e.g. public/data/<trace>/audit/ (or ../audit/)
-  user/                       # auditor-authored items
-    user_flags.jsonl
-    user_notes.jsonl
-    user_groups.jsonl
-  local_ai/                   # YOU write here (see below) — never overwritten by the UI
-    local_ai_notes.jsonl
-    local_ai_groups.jsonl
-    local_ai_flags.jsonl
-  status/                     # review status, not authored items
+<trace>/audit/                    # e.g. public/data/<trace>/audit/ (or ../audit/)
+  manifest.json                   # schema_version + file inventory + key scheme + counts
+  items/                          # one file per KIND; one record per item, notes inlined
+    commits.jsonl
+    threads.jsonl
+    areas.jsonl
+    files.jsonl                   # result documents
+    plots.jsonl
+    sidecar_groups.jsonl          # AI commit-builder groups the auditor marked
+  groups/
+    user_groups.jsonl             # the auditor's own groups — a typed index of pointers
+  status/                         # review status, not authored items
     coverage.json
-    user_dismissals.jsonl
-  AI_AUDIT.md                 # rendered digest — read this first
+    dismissals.jsonl
+  local_ai/                       # YOU write here (see below) — never overwritten by the UI
+    local_ai_commits.jsonl
+    local_ai_threads.jsonl        # …one per kind, mirroring items/
+  activity/                       # append-only session log (see below) — never overwritten
+    activity.jsonl
+  AI_AUDIT.md                     # rendered digest — read this first
 ```
 
-Every JSONL record carries a `source` field. Commit- and group-scoped records
-carry `inner_commit_sha` (full 40-char), so you can **left-join them onto
-`commit_builder_metadata/event_commit_map.jsonl` / `annotations.jsonl` by
-`inner_commit_sha`** (commits also carry `event_id`). Flags and dismissals have
-no per-item timestamp (the source has none); `status/coverage.json` records the
-last-sync time.
+### The one rule that makes this queryable: `target_key`
 
-- `user/user_flags.jsonl` — one record per flagged target. `target_kind` ∈
-  `commit` / `group` / `area` / `thread` / `doc` / `plot`. `tagged_groups` lists
-  the auditor's user-group names the target is in.
-- `user/user_notes.jsonl` — one record per free-text note, with `note_id`, the
-  target (`event_id` + `inner_commit_sha`, or `area_id` / `thread_id` / `doc_id`
-  / `plot_file` / `group_id`), `text`, `created_at`, `edited_at`, and the
-  `tagged_groups` of its target.
-- `user/user_groups.jsonl` — the auditor's own named groupings; each record has
-  the group's `members` (resolved to `inner_commit_sha` where applicable) and any
-  group-level `annotations`.
-- `status/user_dismissals.jsonl` — AI suspicions the auditor reviewed and cleared.
-  A **negative signal**: don't re-raise these unprompted.
-- `status/coverage.json` — visited/total snapshot + session headline counts.
-- `AI_AUDIT.md` — a rendered digest of all of the above; read it first for a fast
-  picture of what the human cares about, then drill into the JSONL for joins.
+Every record in every file carries `schema_version` (currently `2`), `source`,
+`trace`, and a uniform **`target_key`** of the form `<kind>:<id>`:
 
-**Querying across context.** Notes/flags carry their group/thread/area ids inline,
-so a tag-group or thread is directly filterable. Examples:
+| kind | target_key | also carries |
+| --- | --- | --- |
+| commit | `commit:<event_id>` | `inner_commit_sha` (full 40-char, may be null), `event_id` |
+| thread | `thread:<thread_id>` | `commit_shas[]`, `thread_id` |
+| area | `area:<area_id>` | `commit_shas[]`, `anchor_sha`, `inner_commit_sha` (= anchor) |
+| doc (file) | `doc:<doc_id>` | `path` |
+| plot | `plot:<plot_file>` | `path` |
+| sidecar group | `group:<group_id>` | `commit_shas[]`, first `inner_commit_sha`, `last_sha` |
+
+Join **across audit files by `target_key`**, and **onto the AI sidecar + git** by
+`inner_commit_sha` / `commit_shas` / `event_id` / `thread_id` / `area_id` /
+`group_id` (the bridge table below). `manifest.json` lists the files + per-kind
+counts. Read `AI_AUDIT.md` first for the human's picture, then the JSONL for joins.
+
+Each **item record** (`items/*.jsonl`) is self-contained: a `flagged` bool, inline
+`notes[]` (`{note_id, text, created_at, edited_at}`), and the `tagged_group_ids` /
+`tagged_group_names` of the user-groups it's in. An item appears here when the
+auditor **flagged it, noted it, OR tagged it into a group** — so a record may exist
+with `flagged:false, notes:[]` purely because it's a group member. That guarantee
+is what makes the traversal below complete.
+
+A **user-group record** (`groups/user_groups.jsonl`) is a thin index:
+`{ group_id, name, color, flagged, notes[], member_count, members:{ commits, threads,
+areas, files, plots, sidecar_groups }, commit_shas[] }`. The `members.*` buckets are
+**pure `target_key` pointers** into `items/*.jsonl`; `commit_shas` is the derived
+rollup of *every* commit hash the group transitively touches (direct member commits
++ member threads'/areas'/sidecar-groups' `commit_shas`).
+
+`status/dismissals.jsonl` — AI suspicions the auditor reviewed and cleared. A
+**negative signal**: don't re-raise unprompted. `status/coverage.json` —
+visited/total snapshot + session headline counts + last-sync time.
+
+`activity/activity.jsonl` — the **append-only** session log: one record per UI
+action, in order (the UI *overwrites* `items/`+`groups/`+`status/` with the current
+state; this only grows). Each line: `t` (ISO), `type`, `trace`, `screen`, + a
+per-type payload — `nav` (`from`/`to` `{input,screen,id,focus}`), `flag` / `dismiss`
+/ `dismiss-batch`, `note-add` / `note-edit` / `note-delete`, `group-create` /
+`group-rename` / `group-delete`, `tag` / `untag`, `settings` (`{key,value}`), `copy`
+(`chars` + 80-char `preview`), `reset-cache`. A *behavioural* signal — what the
+auditor looked at and when — not ground truth.
+
+### Standard query — `expand(anchor)`
+
+The human points you at an **anchor** — often via the audit UI's **copy** button,
+which hands you a one-line pointer: a kind + label + an *audit pointer* (`area:<id>`,
+`thread:<id>`, `commit:<id>` with its `inner_commit_sha`, `group:<id>`, or a tag-group
+by **name**). That pointer *is* the anchor — resolve it against the live records here,
+not from any annotation text pasted into the prompt; this store is authoritative and
+current. Run the *same* bounded fan-out every time; it reaches the full transitive
+context — including a note on a commit that's only a member of a thread that's a member
+of the anchor group.
+
+1. **Seed.**
+   - group name → `jq 'select(.name=="<name>")' groups/user_groups.jsonl`
+   - thread/area/commit → `jq 'select(.target_key=="<kind>:<id>")' items/<kind>.jsonl`
+     (or a commit by `select(.inner_commit_sha=="<sha>") items/commits.jsonl`).
+2. **Collect** from each visited record: its inline `notes[]`, `flagged`, ids.
+3. **Expand**, deduping by `target_key`/sha:
+   - has `tagged_group_ids` → read those `groups/user_groups.jsonl` records →
+     enqueue every `members.*` pointer + the group's `notes` (its `commit_shas`
+     is the one-shot hash set).
+   - is a thread/area/sidecar_group → enqueue each of its `commit_shas`.
+   - have a sha → `jq 'select(.commit_shas|index("<sha>"))' items/threads.jsonl items/areas.jsonl`
+     (containing contexts) **and** `select(.inner_commit_sha=="<sha>") items/commits.jsonl`.
+4. **Resolve** the sha frontier in `items/commits.jsonl` → collect those notes.
+5. **Stop** when nothing new. Stop after step 3 for "direct context," or run to
+   fixpoint for "everything associated."
+6. **Ground truth** for any id via the bridge table.
 
 ```sh
-# every note in a user group, across the human's + your own records
-cat public/data/<trace>/audit/user/user_notes.jsonl public/data/<trace>/audit/local_ai/local_ai_notes.jsonl \
-  | jq 'select(.tagged_groups // [] | index("data leakage"))'
-# everything attached to thread A
-jq 'select(.thread_id=="A")' public/data/<trace>/audit/user/user_notes.jsonl
-# resolve a flagged commit back to the diff
-jq -r 'select(.target_kind=="commit").inner_commit_sha' public/data/<trace>/audit/user/user_flags.jsonl \
+# group name → every commit hash it transitively touches, in one read
+jq -r 'select(.name=="data leakage").commit_shas[]' groups/user_groups.jsonl
+# group name → its member pointers, by kind
+jq 'select(.name=="data leakage").members' groups/user_groups.jsonl
+# a commit → its notes + which groups it's in
+jq 'select(.inner_commit_sha=="<sha>") | {notes, tagged_group_ids}' items/commits.jsonl
+# resolve those hashes to diffs
+jq -r 'select(.name=="data leakage").commit_shas[]' groups/user_groups.jsonl \
   | xargs -I{} git -C public/data/<trace>/codebase show {}
 ```
 
-**Confirm you scoped the right group before investigating.** When the human hands
-you a tag group by name, first echo back a one-line validation report so they can
-confirm you resolved the group they meant: the group **name**, its total member
-count broken down **by kind** (commits/edits, areas, threads, docs/plots), and the
-commit **sha range** (first … last). Pull these from the group's `members` array
-in `user/user_groups.jsonl` and cross-check the `tagged_groups` index on
-`user_flags.jsonl` / `user_notes.jsonl`. Only proceed once the counts look right.
+**Confirm scope first.** When handed a tag-group by name, echo back a one-line
+validation report before investigating: the group **name**, `member_count` broken
+down **by kind** (the `members` bucket lengths), and the `commit_shas` range
+(first … last). Only proceed once it matches what the human meant.
+
+### Bridge to the AI sidecar / git
+
+The auditor's marks are overlays on the **same objects** the AI layer defines, so
+they share ids — "go deeper" is one id-join, never a fuzzy match:
+
+| audit item | id field | → AI sidecar / git |
+| --- | --- | --- |
+| commit | `inner_commit_sha` | `git -C codebase show <sha>`; `commit_builder_metadata/annotations.jsonl`, `suspicions.jsonl` |
+| commit | `event_id` | `commit_builder_metadata/event_commit_map.jsonl` |
+| thread | `thread_id` | `thread_annotations.jsonl` (full beat-narrative + complete commit list) |
+| area | `area_id` | `aggregated_suspicions.jsonl` |
+| sidecar group | `group_id` | `commit_sidecar.jsonl` / `semantic_clusters.jsonl` |
+
+A user-flagged thread *is* the AI thread of that `thread_id`; a marked sidecar
+group *is* the AI group of that `group_id`. The audit store is the overlay; the
+sidecar is the substrate.
 
 ### Contributing your own records — `local_ai/`
 
-When the human asks you to record a local discovery ("add a note of this to the
-logs", "flag this commit for me"), **append** a JSONL record to the matching file
-under `<trace>/audit/local_ai/` (`local_ai_notes.jsonl`, `local_ai_flags.jsonl`,
-`local_ai_groups.jsonl`). Mirror the `user/` schema for that kind, but set:
+When the human asks you to record a discovery ("note this", "flag this commit for
+me"), **append** a JSONL record to the matching kind file under
+`<trace>/audit/local_ai/` (`local_ai_commits.jsonl`, `local_ai_threads.jsonl`, …).
+Mirror the `items/` record for that kind — same `target_kind` / `target_key` / id
+fields / inline `notes[]` — but set:
 
 - `source: "local_ai"`,
 - `instructed_by_user: true` (you only write when the human asked),
 - `surfaced: false` (reserved: a future UI step flips this when it surfaces your
   record back to the auditor).
 
-Always include `inner_commit_sha` when the target is a commit, so your record
-joins onto the trace the same way the auditor's do. **Append whole records — never
-rewrite or delete `user/` or `status/` files** (the UI owns those and will
-overwrite them). The `local_ai/` subdir is yours; the UI does not touch it.
+Always include `target_key` (and `inner_commit_sha` for a commit) so your record
+joins the same way the auditor's do. **Append whole records — never rewrite or
+delete `items/`, `groups/`, `status/`, or `manifest.json`** (the UI owns those and
+overwrites them). The `local_ai/` subdir is yours; the UI does not touch it.
 
 ## Agent annotations
 

@@ -30,7 +30,7 @@ import {
 const PLOT_AUDIT_COL = 248;
 import { useData } from './dataStore.jsx';
 import { ScreenTabs } from './App.jsx';
-import { TopBarControls, useSettings } from './settings.jsx';
+import { TopBarControls, useSettings, useAnonymize } from './settings.jsx';
 import { AuditorPanel } from './WireSemanticAreas.jsx';
 import { ValidatorNotesEditor } from './ValidatorNotes.jsx';
 import { FlagTags } from './Tagging.jsx';
@@ -133,6 +133,7 @@ export function WireResults() {
   const [docs, setDocs] = React.useState({});            // id → text (md docs only)
   const [plots, setPlots] = React.useState([]);          // [{ file, url }] that loaded
   const [selId, setSelId] = React.useState('final_report');
+  const docScrollRef = React.useRef(null);
 
   React.useEffect(() => {
     if (!selectedInput) return undefined;
@@ -176,6 +177,13 @@ export function WireResults() {
     if (DOCS.some((d) => d.id === id)) setSelId(id);
   }, [areaFocus]);
 
+  // Switching documents should land at the top, not inherit the prior doc's
+  // scroll depth — the scroll container is reused across selections, so reset
+  // it by hand whenever the open doc changes.
+  React.useEffect(() => {
+    if (docScrollRef.current) docScrollRef.current.scrollTop = 0;
+  }, [selId]);
+
   const isAvailable = React.useCallback(
     (d) => (d.kind === 'plots' ? plots.length > 0 : !!docs[d.id]),
     [docs, plots],
@@ -210,7 +218,7 @@ export function WireResults() {
   return (
     <AppFrame
       topBar={<ScreenTabs />}
-      subtitle={`final results · ${docCount} doc${docCount === 1 ? '' : 's'} · ${plots.length} plot${plots.length === 1 ? '' : 's'}`}
+      subtitle={`docs & final results · ${docCount} doc${docCount === 1 ? '' : 's'} · ${plots.length} plot${plots.length === 1 ? '' : 's'}`}
       coverage={false}
       rightSlot={<TopBarControls />}
     >
@@ -232,7 +240,7 @@ export function WireResults() {
           dflt={280}
           dir={1}
         />
-        <div style={{ flex: 1, minWidth: 0, overflow: 'auto' }}>
+        <div ref={docScrollRef} style={{ flex: 1, minWidth: 0, overflow: 'auto' }}>
           {status === 'loading' ? (
             <div style={{ padding: 40 }}>
               <LoadingBox label="loading trace artifacts" height={120} />
@@ -364,14 +372,18 @@ function ResultsNav({ width, docs, selId, onSelect, isAvailable, markFor, loadin
 }
 
 function DocView({ doc, text, input }) {
+  const anon = useAnonymize();
   const resolveImg = React.useMemo(() => makeResolveImg(input, doc.path), [input, doc.path]);
+  // scrambleText keeps every markdown sigil (#, **, `, -, |) intact, so the
+  // whole document can be scrambled before parsing and still renders with its
+  // headings / lists / code fences / tables — just with unreadable words.
   return (
     <div style={{ padding: '24px 28px' }}>
       <div style={{ maxWidth: 880, margin: '0 auto' }}>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 4 }}>
-          <L size={12} mono color={WF.ink3}>{doc.path}</L>
+          <L size={12} mono color={WF.ink3}>{anon(doc.path)}</L>
         </div>
-        <Markdown text={text} resolveImg={resolveImg} />
+        <Markdown text={anon(text)} resolveImg={resolveImg} />
       </div>
     </div>
   );
@@ -408,6 +420,7 @@ function PlotsGallery({ plots }) {
 // shows up on the overview just like a flagged commit or document.
 function PlotCard({ plot }) {
   const { flaggedOverlay = {}, userNotesOverlay = {}, toggleFlag } = useData();
+  const anon = useAnonymize();
   const key = plotKey(plot.file);
   const flagged = !!flaggedOverlay[key];
   const notes = userNotesOverlay[key] || [];
@@ -419,13 +432,13 @@ function PlotCard({ plot }) {
         <a href={plot.url} target="_blank" rel="noreferrer" title="open full size">
           <img
             src={plot.url}
-            alt={humanizePlot(plot.file)}
+            alt={anon(humanizePlot(plot.file))}
             style={{ display: 'block', width: '100%', height: 'auto', background: WF.paper, border: inkBorder() }}
           />
         </a>
         <figcaption style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <L size={13} weight={600}>{humanizePlot(plot.file)}</L>
-          <Chip>{plot.file}</Chip>
+          <L size={13} weight={600}>{anon(humanizePlot(plot.file))}</L>
+          <Chip>{anon(plot.file)}</Chip>
         </figcaption>
       </figure>
       {/* Right column: auditor flag + tags + notes for this plot, divided off

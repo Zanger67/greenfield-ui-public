@@ -22,4 +22,5 @@ docs_local
 
 
 
-docs/
+docs/*
+!docs/readme instructions/

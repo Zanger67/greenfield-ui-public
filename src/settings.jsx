@@ -9,8 +9,9 @@
 // order, kind/source — are NOT timestamps and stay visible regardless; only
 // the literal date/time strings are gated (see <Stamp>).
 import React from 'react';
-import { WF, L, inkBorder } from './primitives.jsx';
+import { WF, L, inkBorder, scrambleText } from './primitives.jsx';
 import { useData } from './dataStore.jsx';
+import { logActivity } from './activityLog.js';
 
 const SETTINGS_KEY = 'redlogs:settings';
 // `inboxSubline` chooses what the greyed secondary line under each inbox row
@@ -46,13 +47,25 @@ const DEFAULTS = {
   // below re-asserts it and drives live toggling.
   darkMode: true,
   showTimestamps: false,
-  showCommitHashes: true,
+  // Per-commit short SHAs in dossier rows / tree. Defaults OFF — the hashes are
+  // navigational noise for most of an audit (every row reads as an opaque 7-char
+  // blob); flip it on from the gear popover when you actually need to cross-ref a
+  // specific commit. Gates the <Sha> column in WireDossierInbox and the related-row
+  // prefix; see <Sha> in this file.
+  showCommitHashes: false,
   // Source-diff line numbers (old/new gutter on the left of each hunk). Defaults
   // ON — the gutter is the quickest way to map a flagged change back to a file
   // location, and it's the standard shape auditors expect from a code diff. Only
   // the source-file diff body honors it; the append-only log views render
   // filtered changed-lines with no hunk headers, so numbering there is moot.
   showLineNumbers: true,
+  // The "audit event" box on a file-edit dossier — the raw audit-event payload
+  // (file / event / action / baseline). It's a low-level detail most of an audit
+  // doesn't need surfaced on every commit, so it defaults OFF; flip it on from
+  // the gear popover. Only the audit-source box is gated — the shell-command,
+  // claude-tool, and event-payload boxes are unaffected. See <RawLineDetail> and
+  // its call site in <DossierBody>.
+  showAuditEventBox: false,
   // The AI suspicion layer (narrator flag levels, the suspicion sections,
   // flagged semantic areas, the suspect filter facet, the heat gutter) defaults
   // OFF — anti-anchoring. A fresh auditor forms an independent read of the trace
@@ -69,6 +82,19 @@ const DEFAULTS = {
   // an item also flags it, the reminder is just clutter on every dossier — so
   // it defaults OFF. Flip it on from the gear popover. See <TagFlagsHint>.
   showTagFlagsHint: false,
+  // "Anonymous mode" — a privacy screen for screenshots / screen-shares / external
+  // demos. When ON, every piece of on-screen text DERIVED FROM THE TRACE (code,
+  // diffs, commands, agent/narrator annotations, commit messages, file paths,
+  // documents, the trace label) is run through scrambleText (see primitives.jsx):
+  // same silhouette — word lengths, line breaks, indentation, +/- gutters,
+  // markdown markers — with the letters/digits replaced. Defaults OFF. It is a
+  // pure RENDER-TIME transform: the underlying data is untouched, so navigation,
+  // git lookups, filters, and the AI_AUDIT.md export all keep operating on the
+  // real values. UI chrome (labels, headers, settings) and the auditor's OWN
+  // markup (notes, group names, validator notes, tags) are NOT scrambled —
+  // anonymisation covers what came from the trace, not what you typed. The toggle
+  // reaches every site via the `anon` function from useAnonymize(); see <Anon>.
+  anonymize: false,
   paneWidths: PANE_DEFAULTS,
 };
 
@@ -120,6 +146,10 @@ export function SettingsProvider({ children }) {
       try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(next)); } catch { /* quota / disabled storage */ }
       return next;
     });
+    // One chokepoint for every scalar display toggle — AI-flags on/off, dark/light
+    // mode, anonymous mode, the gear-popover switches. (Pane-resize drags go
+    // through setPaneWidth and are intentionally NOT logged — far too noisy.)
+    logActivity('settings', { key, value });
   }, []);
 
   // Pane widths change on every pointermove of a drag, so update React state
@@ -142,6 +172,27 @@ export function SettingsProvider({ children }) {
     [settings, setSetting, setPaneWidth],
   );
   return <SettingsContext.Provider value={value}>{children}</SettingsContext.Provider>;
+}
+
+// `anon(str)` — the anonymous-mode text transform. Identity when the setting is
+// OFF (zero cost; the original value, including null / non-strings, passes
+// straight through), and the shape-preserving scrambleText when ON. Memoised on
+// the flag so it's a stable reference across renders. Every data-text render
+// site routes its string through this — either by calling the hook directly
+// (`const anon = useAnonymize()`) or via the <Anon> wrapper below. See the
+// `anonymize` DEFAULTS comment for exactly what is / isn't covered.
+export function useAnonymize() {
+  const { anonymize } = useSettings();
+  return React.useCallback((s) => (anonymize ? scrambleText(s) : s), [anonymize]);
+}
+
+// Convenience wrapper for the common inline case: <Anon>{value}</Anon> renders
+// the scrambled (or, when off, original) string. Accepts a single string child;
+// for richer content (markdown, nested nodes) call the hook and wrap the source
+// string before it's parsed.
+export function Anon({ children }) {
+  const anon = useAnonymize();
+  return <>{anon(children)}</>;
 }
 
 // A timestamp display gated by the `showTimestamps` setting. When the setting
@@ -190,7 +241,7 @@ export function TagFlagsHint({ noun, style }) {
 // Lives at the far right of the top bar. A small unobtrusive gear; clicking it
 // drops a popover with the available toggles. Closes on outside-click / Escape.
 export function SettingsButton() {
-  const { showTimestamps, showCommitHashes, showLineNumbers, inboxSubline, inboxTitleFromShortTitle, showTagFlagsHint, setSetting } = useSettings();
+  const { showTimestamps, showCommitHashes, showLineNumbers, showAuditEventBox, inboxSubline, inboxTitleFromShortTitle, showTagFlagsHint, anonymize, setSetting } = useSettings();
   const [open, setOpen] = React.useState(false);
   const wrapRef = React.useRef(null);
 
@@ -268,6 +319,14 @@ export function SettingsButton() {
             />
           </div>
           <div style={{ marginTop: 12 }}>
+            <ToggleRow
+              label="show audit event box"
+              hint="raw audit-event payload on file-edit dossiers"
+              checked={showAuditEventBox}
+              onChange={(v) => setSetting('showAuditEventBox', v)}
+            />
+          </div>
+          <div style={{ marginTop: 12 }}>
             <SelectRow
               label="inbox subline"
               hint="greyed line under each row"
@@ -292,6 +351,16 @@ export function SettingsButton() {
               onChange={(v) => setSetting('showTagFlagsHint', v)}
             />
           </div>
+          <div style={{ borderTop: inkBorder(1.2), margin: '10px -12px 0', paddingTop: 10 }} />
+          <L mono size={10} color={WF.ink3} style={{ display: 'block', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+            privacy
+          </L>
+          <ToggleRow
+            label="anonymous mode"
+            hint="scramble all trace-derived text (code, diffs, annotations) for safe screenshots"
+            checked={anonymize}
+            onChange={(v) => setSetting('anonymize', v)}
+          />
           <div style={{ borderTop: inkBorder(1.2), margin: '10px -12px 0', paddingTop: 10 }} />
           <L mono size={10} color={WF.ink3} style={{ display: 'block', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>
             session
@@ -393,14 +462,50 @@ export function ThemeToggle() {
   );
 }
 
+// ── Help / readme button (top-bar icon) ─────────────────────────────────────
+// Opens the README, rendered, as a full screen (see WireReadme). It's the
+// first-open default and stays one click away here. Sized/bordered to match the
+// theme toggle + gear so the three sit as a matched icon group. Fills (active)
+// while the help screen is open; clicking it then returns to the timeline.
+export function HelpButton() {
+  const { screen, goScreen } = useData();
+  const active = screen === 'help';
+  return (
+    <button
+      aria-label="help and readme"
+      aria-pressed={active}
+      title={active ? 'help — click to return to the timeline' : 'help — the README, rendered'}
+      onClick={() => goScreen(active ? 'dossier' : 'help')}
+      style={{
+        width: 24,
+        height: 24,
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: 0,
+        fontSize: 14,
+        lineHeight: 1,
+        fontWeight: 700,
+        border: inkBorder(active ? 1.5 : 1.2),
+        background: active ? WF.ink : WF.paper,
+        color: active ? WF.paper : WF.ink2,
+        cursor: 'pointer',
+      }}
+    >
+      ?
+    </button>
+  );
+}
+
 // Groups the controls mounted in each screen's AppFrame `rightSlot`: the AI-flags
-// pill (the most consequential control, so it leads), then the theme toggle and
-// the settings gear as a matched icon pair.
+// pill (the most consequential control, so it leads), then the help / theme /
+// settings icons as a matched trio.
 export function TopBarControls() {
   return (
     <div style={{ display: 'inline-flex', alignItems: 'center', gap: 12 }}>
       <AiFlagsToggle />
       <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+        <HelpButton />
         <ThemeToggle />
         <SettingsButton />
       </div>

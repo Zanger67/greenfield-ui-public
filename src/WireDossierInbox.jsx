@@ -15,7 +15,7 @@ import {
   Tiles,
   Chip,
   Check,
-  CopyTitle,
+  useCopy,
   refStatement,
   AppFrame,
   LoadingBox,
@@ -25,7 +25,7 @@ import {
 } from './primitives.jsx';
 import { useData } from './dataStore.jsx';
 import { ScreenTabs, CheckoutContext } from './App.jsx';
-import { TopBarControls, Stamp, Sha, TagFlagsHint, useSettings, PANE_DEFAULTS } from './settings.jsx';
+import { TopBarControls, Stamp, Sha, TagFlagsHint, useSettings, useAnonymize, PANE_DEFAULTS } from './settings.jsx';
 import { ValidatorNotesEditor } from './ValidatorNotes.jsx';
 import { TagEditor } from './Tagging.jsx';
 
@@ -711,13 +711,16 @@ function CommitRow({ row, current, checkedOut, pendingCheckout, onSelect, onHold
   // greyed secondary line is selectable (operation / short title / clipped
   // description / none).
   const { inboxSubline, inboxTitleFromShortTitle } = useSettings();
-  const mainTitle =
-    (inboxTitleFromShortTitle && row.shortTitle ? row.shortTitle : row.title) || '(untitled)';
-  const subline =
+  const anon = useAnonymize();
+  const mainTitle = anon(
+    (inboxTitleFromShortTitle && row.shortTitle ? row.shortTitle : row.title) || '(untitled)',
+  );
+  const subline = anon(
     inboxSubline === 'none' ? ''
     : inboxSubline === 'shortTitle' ? row.shortTitle
     : inboxSubline === 'annotation' ? clipText(row.annotationText, 120)
-    : row.summary;  // 'operation' (default)
+    : row.summary,  // 'operation' (default)
+  );
 
   return (
     <div
@@ -881,16 +884,27 @@ const GROUP_KIND = {
 };
 const groupMeta = (kind) => GROUP_KIND[kind] || GROUP_KIND.default;
 
-// File-class descriptor for a whole group, used to name it in the main title:
-// "data commit group" / "code commit group". Reuses the per-commit code/data
-// palette for coloring. A group qualifies only when it is *entirely* one class
-// — every classifiable member must agree. Returns null otherwise (mixed source
-// + artifacts, or no member with a usable extension, e.g. a directory deletion
-// of extensionless paths), and the title falls back to the group_kind label.
+// File-class descriptor for a whole group: the color + hover explanation behind
+// the main title. The title *text* is composed by groupTitleLabel (class noun +
+// kind noun); this map only owns the per-class palette (reused from the
+// per-commit code/data styling) and the tooltip. A group qualifies for a class
+// only when it is *entirely* one class — every classifiable member must agree
+// (see groupFileClass). Returns null otherwise (mixed source + artifacts, or no
+// member with a usable extension), and the title falls back to the kind label.
 const GROUP_CLASS_STYLE = {
-  data: { fg: FILECLASS_STYLE.data.fg, label: 'data commit group', title: 'every classified member touches data / results artifacts (json, png, …)' },
-  code: { fg: FILECLASS_STYLE.code.fg, label: 'code commit group', title: 'every classified member edits authored source' },
+  data: { fg: FILECLASS_STYLE.data.fg, title: 'every classified member touches data / results artifacts (json, png, …)' },
+  code: { fg: FILECLASS_STYLE.code.fg, title: 'every classified member edits authored source' },
 };
+
+// Compose the file-class-qualified group title. "data commit group" /
+// "code commit group" for additive kinds; the destructive kinds swap the noun
+// → "data deletion group", so a group that *removed* results no longer reads as
+// an additive commit (a dir_deletion of all-data files used to mislabel as
+// "data commit group"). Falls back to the group_kind label when the group isn't
+// uniformly one class (cls === null).
+const GROUP_CLASS_NOUN = { dir_deletion: 'deletion', file_deletion: 'deletion' };
+const groupTitleLabel = (cls, kind, meta) =>
+  cls ? `${cls} ${GROUP_CLASS_NOUN[kind] || 'commit'} group` : meta.label;
 
 // 'data' | 'code' when the whole group is that one class, else null.
 function groupFileClass(members) {
@@ -999,6 +1013,7 @@ function buildDisplayItems(rows) {
 // member commits as small, dimmed, indented sub-rows. Clicking the header
 // selects the group (→ cumulative diff); clicking a sub-row opens that commit.
 function GroupRow({ group, currentGroup, currentCommitId, currentRowRef, checkout, onSelectGroup, onSelectCommit }) {
+  const anon = useAnonymize();
   const [open, setOpen] = React.useState(true);
   const { flaggedOverlay = {} } = useData();
   const meta = groupMeta(group.kind);
@@ -1007,7 +1022,7 @@ function GroupRow({ group, currentGroup, currentCommitId, currentRowRef, checkou
   const cls = groupFileClass(group.members);
   const clsStyle = cls ? GROUP_CLASS_STYLE[cls] : null;
   const fcStyle = cls ? FILECLASS_STYLE[cls] : null;
-  const titleLabel = clsStyle ? clsStyle.label : meta.label;
+  const titleLabel = groupTitleLabel(cls, group.kind, meta);
   const userGroupFlagged = !!flaggedOverlay[groupFlagKey(group.id)];
 
   return (
@@ -1074,7 +1089,7 @@ function GroupRow({ group, currentGroup, currentCommitId, currentRowRef, checkou
           <L
             size={13}
             style={{ display: 'block', marginTop: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-          >{group.root || '(group)'}</L>
+          >{anon(group.root || '(group)')}</L>
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
           {userGroupFlagged && (
@@ -1129,7 +1144,7 @@ function GroupRow({ group, currentGroup, currentCommitId, currentRowRef, checkou
               size={11}
               color={WF.ink3}
               style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-            >{m.title || '(untitled)'}</L>
+            >{anon(m.title || '(untitled)')}</L>
             {mark ? (
               <Chip
                 style={{ background: mark.bg, color: mark.fg, borderColor: mark.bg, alignSelf: 'center' }}
@@ -1232,21 +1247,34 @@ function flattenMemberTree(root) {
   return rows;
 }
 
+// Group kinds whose every member is a file/directory path — always renderable
+// as a directory tree. A dir_deletion emits a DELETE per file *and* per
+// directory (depth-first), so its final member is the bare root dir (e.g.
+// "_test_results": no slash, no extension), which fails the per-member
+// path-shape heuristic below and would otherwise drop the whole group to the
+// flat list. Keying off the kind keeps the tree; unknown / mixed-command groups
+// still fall back to the heuristic.
+const PATH_GROUP_KINDS = new Set([
+  'creation_sequence', 'edit_sequence', 'data_write_sequence', 'dir_deletion', 'file_deletion',
+]);
+
 // The group dossier's clickable member-commit list, in its own box. `style`
 // lets GroupDossier size it as a flex column when it pairs with the annotations
 // box side by side.
-function MemberCommitsBox({ members, onSelectCommit, style }) {
+function MemberCommitsBox({ members, kind, onSelectCommit, style }) {
   // Groups whose members are all file paths (commit groups + deletion groups)
   // render as a real directory tree sorted by path — independent of the SHA
   // toggle: with hashes on the tree gets a leading short-SHA column, with them
   // off the tree slides left to fill the gap. Mixed / command groups fall back
   // to the flat title list.
   const { showCommitHashes } = useSettings();
+  const anon = useAnonymize();
   const treeMode = members.length > 0
-    && members.every((m) => {
-      const p = memberPath(m);
-      return p.includes('/') || /\.[\w]+$/.test(p);
-    });
+    && (PATH_GROUP_KINDS.has(kind)
+      || members.every((m) => {
+        const p = memberPath(m);
+        return p.includes('/') || /\.[\w]+$/.test(p);
+      }));
   // One grid template for every tree row (dir + leaf) so the path column — and
   // therefore the box-drawing prefix — lines up whether or not the SHA shows.
   const treeCols = showCommitHashes ? '64px 1fr auto 84px' : '1fr auto 84px';
@@ -1267,7 +1295,7 @@ function MemberCommitsBox({ members, onSelectCommit, style }) {
                 return (
                   <div key={r.key} style={{ display: 'grid', gridTemplateColumns: treeCols, gap: 8, alignItems: 'baseline', padding: '2px 4px' }}>
                     {showCommitHashes && <span />}
-                    <L mono size={11} color={WF.ink3} style={cell}>{r.prefix}{r.label}</L>
+                    <L mono size={11} color={WF.ink3} style={cell}>{r.prefix}{anon(r.label)}</L>
                     <span />
                     <span />
                   </div>
@@ -1278,7 +1306,7 @@ function MemberCommitsBox({ members, onSelectCommit, style }) {
                 <div
                   key={r.key}
                   onClick={() => onSelectCommit(r.member.id)}
-                  title={r.path + (mark ? ` · ${mark.label}` : '')}
+                  title={anon(r.path) + (mark ? ` · ${mark.label}` : '')}
                   style={{
                     display: 'grid',
                     gridTemplateColumns: treeCols,
@@ -1292,7 +1320,7 @@ function MemberCommitsBox({ members, onSelectCommit, style }) {
                   }}
                 >
                   {showCommitHashes && <Sha sha={r.member.sha} len={8} size={11} color={WF.ink2} />}
-                  <L mono size={11} color={WF.ink2} style={cell}>{r.prefix}{r.label}</L>
+                  <L mono size={11} color={WF.ink2} style={cell}>{r.prefix}{anon(r.label)}</L>
                   {mark ? (
                     <Chip style={{ background: mark.bg, color: mark.fg, borderColor: mark.bg, alignSelf: 'center' }} title={mark.label}>{mark.label}</Chip>
                   ) : <span />}
@@ -1321,7 +1349,7 @@ function MemberCommitsBox({ members, onSelectCommit, style }) {
                 >
                   {showCommitHashes && <Sha sha={m.sha} len={8} size={11} color={WF.ink2} />}
                   <L size={11} color={WF.ink2} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {m.title || '(untitled)'}
+                    {anon(m.title || '(untitled)')}
                   </L>
                   {mark ? (
                     <Chip style={{ background: mark.bg, color: mark.fg, borderColor: mark.bg, alignSelf: 'center' }} title={mark.label}>{mark.label}</Chip>
@@ -1362,10 +1390,60 @@ function FlagTagColumn({ flagged, label, title, onToggle, targetKey, noun, lead 
   );
 }
 
+// Shared "click any header line to copy this commit/group's handoff" behavior for
+// the two right-pane dossier headers. One `useCopy` and one transient flash serve
+// the whole header: every reference line copies the same `copyText`, and the
+// "copied ✓" tick pins to the RIGHT edge of the line that was clicked — so the
+// confirmation always lands beside whatever the auditor clicked (kind badge, git
+// hash, timestamp, title, summary), instead of flashing in a different spot per
+// item. A faint "⧉ copy refs" hint fades in on row hover so the click affordance
+// stays discoverable (it used to live only on the title's CopyTitle).
+//
+// `rowProps(row, extraStyle)` makes a whole header line one click target — so the
+// git hash sitting between the badge and the timestamp copies just like they do —
+// and `renderFlash(row)` drops that line's right-pinned readout (call it last so
+// `marginLeft:auto` flushes it right).
+function useRefCopy(copyText) {
+  const { copied, copy } = useCopy(copyText);
+  const [flashRow, setFlashRow] = React.useState(null);
+  const [hoverRow, setHoverRow] = React.useState(null);
+  const fire = (row) => (e) => { setFlashRow(row); copy(e); };
+  const rowProps = (row, extra = {}) => ({
+    role: 'button',
+    tabIndex: 0,
+    title: 'click to copy references',
+    onClick: fire(row),
+    onKeyDown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fire(row)(e); } },
+    onMouseEnter: () => setHoverRow(row),
+    onMouseLeave: () => setHoverRow((r) => (r === row ? null : r)),
+    style: { display: 'flex', alignItems: 'center', cursor: 'pointer', ...extra },
+  });
+  // opacity (never unmount) keeps the line height stable so the flash doesn't nudge
+  // the layout as it fades; pointerEvents:none keeps it a pure readout.
+  const renderFlash = (row) => {
+    const isCopied = copied && flashRow === row;
+    const show = isCopied || hoverRow === row;
+    return (
+      <L
+        mono
+        size={11}
+        weight={600}
+        color={isCopied ? WF.add : WF.ink3}
+        style={{
+          marginLeft: 'auto', flexShrink: 0, paddingLeft: 12, whiteSpace: 'nowrap',
+          opacity: show ? 1 : 0, transition: 'opacity 0.12s', pointerEvents: 'none',
+        }}
+      >{isCopied ? 'copied ✓' : '⧉ copy refs'}</L>
+    );
+  };
+  return { rowProps, renderFlash };
+}
+
 // Right-pane dossier for a selected group: identity header, a clickable member
 // list, and the cumulative patch the whole group produced.
 function GroupDossier({ group, onSelectCommit }) {
-  const { data, flaggedOverlay = {}, userNotesOverlay = {}, toggleFlag } = useData();
+  const { data, flaggedOverlay = {}, userNotesOverlay = {}, toggleFlag, currentTrace } = useData();
+  const anon = useAnonymize();
   const meta = groupMeta(group.kind);
   const bigChip = { fontSize: 16, padding: '6px 12px', borderRadius: 3 };
   const n = group.members.length;
@@ -1373,7 +1451,7 @@ function GroupDossier({ group, onSelectCommit }) {
   const cls = React.useMemo(() => groupFileClass(group.members), [group.members]);
   const clsStyle = cls ? GROUP_CLASS_STYLE[cls] : null;
   const fcStyle = cls ? FILECLASS_STYLE[cls] : null;
-  const titleLabel = clsStyle ? clsStyle.label : meta.label;
+  const titleLabel = groupTitleLabel(cls, group.kind, meta);
   // The annotations box collapses to nothing when the group carries no group-
   // level or member annotations; only then does it pair side-by-side with the
   // member-commits box (matching DossierBody's annotations/threads split).
@@ -1381,21 +1459,37 @@ function GroupDossier({ group, onSelectCommit }) {
   const flagKey = groupFlagKey(group.id);
   const userGroupFlagged = !!flaggedOverlay[flagKey];
   const groupNotes = userNotesOverlay[flagKey] || [];
+  // One paste-ready POINTER for the whole group: its `group:<id>` target_key joins
+  // onto items/sidecar_groups.jsonl (and the AI sidecar). Not the member hash dump —
+  // the agent expands the pointer for members + notes. Its title, describing line,
+  // and group-kind / file-class badges all copy this same handoff, each with its own
+  // flash so only the line you clicked confirms "copied ✓".
+  const copyText = refStatement({
+    kind: 'commit group',
+    label: group.root || '(group)',
+    targetKey: `group:${group.id}`,
+    detail: `${titleLabel} · ${n} commit${n === 1 ? '' : 's'} ${group.fromSha.slice(0, 7)}…${group.toSha.slice(0, 7)}`,
+    trace: currentTrace,
+  });
+  const { rowProps, renderFlash } = useRefCopy(copyText);
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, minWidth: 0, overflow: 'auto' }}>
       <div style={{ padding: 14, borderBottom: inkBorder() }}>
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 14 }}>
           <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-              <Chip style={{ ...bigChip, background: meta.bg, color: clsStyle ? clsStyle.fg : meta.fg, borderColor: clsStyle ? clsStyle.fg : meta.fg }} title={clsStyle?.title}>
+            {/* Same copy-on-click-any-line behavior as DossierBody (see useRefCopy):
+                the group-kind / file-class badges, the sha range, the commit count,
+                and the timestamp share one clickable line; the title and describing
+                line each get their own — every one flashing on its right edge. */}
+            <div {...rowProps('head', { gap: 10, flexWrap: 'wrap' })}>
+              <Chip style={{ ...bigChip, background: meta.bg, color: clsStyle ? clsStyle.fg : meta.fg, borderColor: clsStyle ? clsStyle.fg : meta.fg }}>
                 {meta.glyph} {titleLabel}
               </Chip>
               {fcStyle && (
-                <Chip
-                  style={{ ...bigChip, background: fcStyle.bg, color: fcStyle.fg, borderColor: fcStyle.fg }}
-                  title={fcStyle.title}
-                >{fcStyle.glyph} {fcStyle.label}</Chip>
+                <Chip style={{ ...bigChip, background: fcStyle.bg, color: fcStyle.fg, borderColor: fcStyle.fg }}>
+                  {fcStyle.glyph} {fcStyle.label}
+                </Chip>
               )}
               <Sha size={13} weight={700} text={`${group.fromSha.slice(0, 7)} … ${group.toSha.slice(0, 7)}`} />
               <Chip>{n} commits</Chip>
@@ -1410,17 +1504,24 @@ function GroupDossier({ group, onSelectCommit }) {
                   ].filter(Boolean).join(' · ')}
                 >⚠ {flagSummary.flaggedCount} of {n} flagged</Chip>
               )}
+              {renderFlash('head')}
             </div>
-            <L size={16} weight={700} style={{ display: 'block', marginTop: 10 }}>{group.root || '(group)'}</L>
-            <L size={12} color={WF.ink2} style={{ display: 'block', marginTop: 4 }}>
-              {n} commits collapsed deterministically by the classify pipeline (group_kind: {group.kind})
-              {cls === 'data'
-                ? ' — every member touches data / results artifacts (json, png, …), not source'
-                : cls === 'code'
-                  ? ' — every member edits authored source'
-                  : ''}. The diff below
-              is the cumulative net change across all of them; click any member to inspect it on its own.
-            </L>
+            <div {...rowProps('title', { marginTop: 10, alignItems: 'baseline' })}>
+              <L size={16} weight={700} style={{ minWidth: 0, wordBreak: 'break-word' }}>{anon(group.root || '(group)')}</L>
+              {renderFlash('title')}
+            </div>
+            <div {...rowProps('summary', { marginTop: 4, alignItems: 'baseline' })}>
+              <L size={12} color={WF.ink2} style={{ minWidth: 0 }}>
+                {n} commits collapsed deterministically by the classify pipeline (group_kind: {group.kind})
+                {cls === 'data'
+                  ? ' — every member touches data / results artifacts (json, png, …), not source'
+                  : cls === 'code'
+                    ? ' — every member edits authored source'
+                    : ''}. The diff below
+                is the cumulative net change across all of them; click any member to inspect it on its own.
+              </L>
+              {renderFlash('summary')}
+            </div>
           </div>
           {/* Flag + tag the whole group, with the tag editor stacked right under
               the flag (visible by default; adding a tag flags the group). */}
@@ -1440,7 +1541,7 @@ function GroupDossier({ group, onSelectCommit }) {
             notes on the whole group (two-per-row tiles); when an optional tile
             is absent the remaining ones fill the row. */}
         <Tiles>
-          <MemberCommitsBox members={group.members} onSelectCommit={onSelectCommit} />
+          <MemberCommitsBox members={group.members} kind={group.kind} onSelectCommit={onSelectCommit} />
           {hasAnnos && <GroupAnnotations group={group} onSelectCommit={onSelectCommit} />}
           <GroupValidatorNotes flagKey={flagKey} notes={groupNotes} flagged={userGroupFlagged} />
         </Tiles>
@@ -1662,6 +1763,7 @@ function StepwiseSequencePanel({ group, onSelectCommit }) {
 // header so the two sections read consistently, but reuses the compact LogDiffRow
 // rather than the full FileDiff treatment.
 function SequenceLogCommit({ member, logs, onSelectCommit }) {
+  const anon = useAnonymize();
   const mark = memberFlagMark(member);
   const border = `1px solid ${WF.rule}`;
   return (
@@ -1686,7 +1788,7 @@ function SequenceLogCommit({ member, logs, onSelectCommit }) {
           size={12}
           color={WF.ink2}
           style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-        >{member.title || '(untitled)'}</L>
+        >{anon(member.title || '(untitled)')}</L>
         {mark && (
           <Chip style={{ background: mark.bg, color: mark.fg, borderColor: mark.bg }} title={mark.label}>{mark.label}</Chip>
         )}
@@ -1712,6 +1814,7 @@ function SequenceLogCommit({ member, logs, onSelectCommit }) {
 // every commit that touched it rendered in chronological order with a downward
 // arrow between consecutive edits.
 function FileProgression({ fp, onSelectCommit }) {
+  const anon = useAnonymize();
   // The header path is a quick shortcut to the first edit's standalone dossier
   // view — the per-edit strips below already deep-link each individual commit,
   // so this just gives the file's chain a one-click "jump to start" affordance.
@@ -1726,7 +1829,7 @@ function FileProgression({ fp, onSelectCommit }) {
           title={headerClickable ? 'open the first commit in this file’s chain' : undefined}
           style={headerClickable ? { cursor: 'pointer', textDecoration: 'underline', textDecorationStyle: 'dotted', textUnderlineOffset: 2 } : undefined}
         >
-          <L mono size={12} weight={700} style={{ wordBreak: 'break-all' }}>{fp.path}</L>
+          <L mono size={12} weight={700} style={{ wordBreak: 'break-all' }}>{anon(fp.path)}</L>
         </span>
         <Chip>{fp.edits.length} edit{fp.edits.length === 1 ? '' : 's'}</Chip>
       </div>
@@ -1749,6 +1852,7 @@ function FileProgression({ fp, onSelectCommit }) {
 // before→after, big bodies keep the preview/expand guard, and source diffs keep
 // the directional context controls.
 function FileEditStep({ member, file, index, total, onSelectCommit }) {
+  const anon = useAnonymize();
   const mark = memberFlagMark(member);
   const adds = file.body.filter((l) => /^\+[^+]/.test(l)).length;
   const dels = file.body.filter((l) => /^-[^-]/.test(l)).length;
@@ -1778,7 +1882,7 @@ function FileEditStep({ member, file, index, total, onSelectCommit }) {
           size={12}
           color={WF.ink2}
           style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-        >{member.title || '(untitled)'}</L>
+        >{anon(member.title || '(untitled)')}</L>
         {!isImage && adds > 0 && <L mono size={11} color={WF.tagGreenFg}>+{adds}</L>}
         {!isImage && dels > 0 && <L mono size={11} color={WF.heat4}>−{dels}</L>}
         {isImage && <Chip>image</Chip>}
@@ -1795,7 +1899,9 @@ function FileEditStep({ member, file, index, total, onSelectCommit }) {
 }
 
 function DossierBody({ chunk, byId, checkedOut, pendingCheckout, checkoutEnabled, onCheckout, onNavigate }) {
-  const { toggleDismiss, toggleFlag } = useData();
+  const { toggleDismiss, toggleFlag, currentTrace } = useData();
+  const { showAuditEventBox } = useSettings();
+  const anon = useAnonymize();
   const style = KIND_STYLE[chunk.kind] || KIND_STYLE.SYNC;
   const bigChip = { fontSize: 16, padding: '6px 12px', borderRadius: 3 };
   // One commit-diff fetch shared by the git-diff box and the bash "output" box.
@@ -1810,26 +1916,44 @@ function DossierBody({ chunk, byId, checkedOut, pendingCheckout, checkoutEnabled
   // Bash events (user-typed `source:'commands'` and Claude `Bash` tool calls)
   // get the command box full-width rather than tiled half-width — see below.
   const isBash = chunk.kind === 'BASH';
+  // One paste-ready reference for this single commit. A single timeline commit is
+  // the one case that carries a direct hash: its `commit:<event_id>` pointer plus
+  // its `inner_commit_sha` so the agent can `git show` straight away. The title,
+  // describing subline, source label, and kind badge all copy this same handoff,
+  // each with its own flash so only the line you clicked confirms "copied ✓".
+  const copyText = refStatement({ kind: 'commit', label: chunk.title || chunk.file || '(untitled)', targetKey: `commit:${chunk.id}`, sha: chunk.sha || null, single: true, trace: currentTrace });
+  const { rowProps, renderFlash } = useRefCopy(copyText);
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, minWidth: 0, overflow: 'auto' }}>
       <div style={{ padding: 14, borderBottom: inkBorder() }}>
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 14 }}>
           <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            {/* Every header line copies the same handoff `copyText` (see useRefCopy):
+                the kind badge, git hash, and timestamp share one clickable line, so
+                the hash now copies just like its neighbors; the title and summary
+                each get their own line. The "copied ✓" tick rides the right edge of
+                whichever line you click. Each line is its own block so the title and
+                summary never share a row. */}
+            <div {...rowProps('head', { gap: 10, flexWrap: 'wrap' })}>
               <Chip style={{ ...bigChip, background: style.bg, color: style.fg, borderColor: style.fg }}>
                 {style.glyph} {(chunk.kindLabel || chunk.kind).toLowerCase()}
               </Chip>
               <Sha sha={chunk.sha} len={12} size={14} weight={700} />
-              <L mono size={12} color={WF.ink2}><Stamp inline>{fmtFullClock(chunk.t)} · </Stamp>{chunk.source}</L>
+              <L mono size={12} color={WF.ink2}>
+                <Stamp inline>{fmtFullClock(chunk.t)} · </Stamp>{chunk.source}
+              </L>
+              {renderFlash('head')}
             </div>
-            <CopyTitle
-              size={16}
-              style={{ marginTop: 10 }}
-              copyText={refStatement({ kind: 'commit', label: chunk.title || chunk.file || '(untitled)', idField: 'event_id', id: chunk.id, shas: chunk.sha ? [chunk.sha] : [] })}
-            >{chunk.title || '(untitled)'}</CopyTitle>
+            <div {...rowProps('title', { marginTop: 10, alignItems: 'baseline' })}>
+              <L size={16} weight={700} style={{ minWidth: 0, wordBreak: 'break-word' }}>{anon(chunk.title || '(untitled)')}</L>
+              {renderFlash('title')}
+            </div>
             {chunk.summary && (
-              <L size={13} color={WF.ink2} style={{ display: 'block', marginTop: 4 }}>{chunk.summary}</L>
+              <div {...rowProps('summary', { marginTop: 4, alignItems: 'baseline' })}>
+                <L size={13} weight={400} color={WF.ink2} style={{ minWidth: 0, wordBreak: 'break-word' }}>{anon(chunk.summary)}</L>
+                {renderFlash('summary')}
+              </div>
             )}
           </div>
           {/* Flag + tag this commit, kept by the git-checkout action with the tag
@@ -1888,7 +2012,13 @@ function DossierBody({ chunk, byId, checkedOut, pendingCheckout, checkoutEnabled
                   <KV k="pane log lines" v={String(chunk.bashContext.pane_log_lines ?? 0)} />
                 </Box>
               ))
-            : <RawLineDetail chunk={chunk} />}
+            // The audit-source box is the "audit event" box gated by the
+            // `showAuditEventBox` setting (default off). Gate at the call site,
+            // not inside RawLineDetail, so Tiles drops the falsy child rather
+            // than keeping a dead half/full-width tile. Other sources are
+            // unaffected. Bash chunks are commands/claude_tools, never audit, so
+            // the full-width RawLineDetail below needs no gate.
+            : (showAuditEventBox || chunk.source !== 'audit') && <RawLineDetail chunk={chunk} />}
         </Tiles>
 
         {(chunk.suspicions || []).length > 0 && (
@@ -1950,6 +2080,7 @@ const FILELOG_STATUS = {
 function FileTimeline({ chunk, byId, onNavigate, width = 256 }) {
   const { selectedInput } = useData();
   const { paneWidths, setPaneWidth, inboxTitleFromShortTitle } = useSettings();
+  const anon = useAnonymize();
   const file = chunk.file;
   // The validator-notes box shares this column with the commit list below the
   // header. `sharedRef` wraps both so the resizer can clamp the notes height to
@@ -2000,9 +2131,9 @@ function FileTimeline({ chunk, byId, onNavigate, width = 256 }) {
       <div style={{ padding: '10px 12px', borderBottom: inkBorder() }}>
         <L size={13} weight={700}>file timeline</L>
         {file ? (
-          <div title={file} style={{ marginTop: 4 }}>
+          <div title={anon(file)} style={{ marginTop: 4 }}>
             <L mono size={11} color={WF.ink2} style={{ display: 'block', overflowWrap: 'anywhere' }}>
-              {basename(file)}
+              {anon(basename(file))}
             </L>
             {state.status === 'ready' && (
               <L mono size={10} color={WF.ink3} style={{ display: 'block', marginTop: 2 }}>
@@ -2082,6 +2213,7 @@ function FileTimeline({ chunk, byId, onNavigate, width = 256 }) {
 }
 
 function TimelineNode({ entry, shortTitle, titleFromShortTitle, isCurrent, isFirst, isLast, targetId, onNavigate }) {
+  const anon = useAnonymize();
   const st = FILELOG_STATUS[entry.status] || { glyph: '·', color: WF.ink3, label: entry.status || 'touched' };
   const clickable = !!targetId && !isCurrent;
   const orphan = !targetId && !isCurrent; // commit touched the file but has no event record
@@ -2090,7 +2222,7 @@ function TimelineNode({ entry, shortTitle, titleFromShortTitle, isCurrent, isFir
   // The hover title always carries the underlying commit message so the real
   // subject stays discoverable even while the headline is shown.
   const useShort = titleFromShortTitle && shortTitle;
-  const label = useShort ? shortTitle : (entry.subject || '(no message)');
+  const label = anon(useShort ? shortTitle : (entry.subject || '(no message)'));
   return (
     <div
       onClick={clickable ? () => onNavigate(targetId) : undefined}
@@ -2135,7 +2267,7 @@ function TimelineNode({ entry, shortTitle, titleFromShortTitle, isCurrent, isFir
           <Stamp size={9} color={WF.ink3}>{fmtShortDate(entry.date)}</Stamp>
         </div>
         <div
-          title={useShort ? `${shortTitle}\n${entry.subject || '(no message)'}` : entry.subject}
+          title={anon(useShort ? `${shortTitle}\n${entry.subject || '(no message)'}` : entry.subject)}
           style={{
             marginTop: 1,
             overflow: 'hidden',
@@ -2148,8 +2280,8 @@ function TimelineNode({ entry, shortTitle, titleFromShortTitle, isCurrent, isFir
           </L>
         </div>
         {entry.from && (
-          <div title={entry.from} style={{ marginTop: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            <L mono size={9} color={WF.ink3}>↳ renamed from {basename(entry.from)}</L>
+          <div title={anon(entry.from)} style={{ marginTop: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <L mono size={9} color={WF.ink3}>↳ renamed from {anon(basename(entry.from))}</L>
           </div>
         )}
       </div>
@@ -2200,7 +2332,7 @@ function basename(p) {
 
 // Resolve a (possibly abbreviated) commit SHA to its chunk. Chunk `.sha` is the
 // full inner_commit_sha, but artifact fields like a suspicion's evidence_commits
-// often carry abbreviated SHAs (e.g. 0022146d1b52) — an exact `c.sha === sha`
+// often carry abbreviated SHAs (a 12-char prefix, not the full 40) — an exact `c.sha === sha`
 // match misses those, which is why such commits showed up unclickable. Mirror
 // makeShaResolver: exact first, then a prefix match in either direction.
 function findCommitBySha(byId, sha) {
@@ -2258,6 +2390,7 @@ function SuspicionsPanel({ suspicions, agg, byId, currentId, onNavigate, dismiss
 }
 
 export function SuspicionDetail({ s, byId, currentId, onNavigate, dimmed }) {
+  const anon = useAnonymize();
   const lvl = LEVEL_STYLE[s.flag_level] || LEVEL_STYLE.low;
   // When the surrounding suspicion is dismissed, drop the entry's red border
   // accent to a muted heat — same content, demoted prominence.
@@ -2268,14 +2401,14 @@ export function SuspicionDetail({ s, byId, currentId, onNavigate, dimmed }) {
         <Chip style={{ background: accent, color: lvl.fg, borderColor: accent }}>{lvl.label}</Chip>
         {s.category && <Chip>{s.category}</Chip>}
         {s.intent_hypothesis && s.intent_hypothesis !== 'unclear' && (
-          <Chip>intent: {s.intent_hypothesis}</Chip>
+          <Chip>intent: {anon(s.intent_hypothesis)}</Chip>
         )}
       </div>
       {s.commit_commentary && (
         <div style={{ marginTop: 6 }}>
           <L size={11} weight={700} color={WF.ink2}>what happened</L>
           <L size={12} style={{ display: 'block', marginTop: 2, lineHeight: 1.45, whiteSpace: 'pre-wrap' }}>
-            {renderInline(s.commit_commentary)}
+            {renderInline(anon(s.commit_commentary))}
           </L>
         </div>
       )}
@@ -2283,7 +2416,7 @@ export function SuspicionDetail({ s, byId, currentId, onNavigate, dimmed }) {
         <div style={{ marginTop: 6 }}>
           <L size={11} weight={700} color={WF.ink2}>why it might matter</L>
           <L size={12} color={WF.ink2} style={{ display: 'block', marginTop: 2, lineHeight: 1.45, whiteSpace: 'pre-wrap' }}>
-            {renderInline(s.suspicion_reasoning)}
+            {renderInline(anon(s.suspicion_reasoning))}
           </L>
         </div>
       )}
@@ -2307,7 +2440,7 @@ export function SuspicionDetail({ s, byId, currentId, onNavigate, dimmed }) {
                   key={sha}
                   style={{ cursor: row && !isCurrent ? 'pointer' : 'default' }}
                   onClick={() => row && !isCurrent && onNavigate(row.id)}
-                  title={isCurrent ? 'the commit you’re viewing' : (row ? row.title : 'unmatched commit')}
+                  title={isCurrent ? 'the commit you’re viewing' : (row ? anon(row.title) : 'unmatched commit')}
                 >{short}{isCurrent ? ' (current)' : (row ? ' →' : '')}</Chip>
               );
             })}
@@ -2337,9 +2470,10 @@ const ACTIVITY_STYLE = {
 const activityStyle = (a) => ACTIVITY_STYLE[a] || ACTIVITY_STYLE.other;
 
 // One annotation line: an activity chip, an optional source label (a member
-// SHA, "whole group", or agent id), and the description. Clickable when it
-// points at a specific commit.
+// SHA or "whole group" — used by the group dossier; the commit dossier passes
+// none), and the description. Clickable when it points at a specific commit.
 function AnnotationItem({ a, sourceLabel, onClick }) {
+  const anon = useAnonymize();
   const st = activityStyle(a.activity);
   return (
     <div
@@ -2352,11 +2486,11 @@ function AnnotationItem({ a, sourceLabel, onClick }) {
           <Chip style={{ background: st.bg, color: st.fg, borderColor: st.fg }}>{a.activity}</Chip>
         )}
         {sourceLabel && (
-          <L mono size={10} color={WF.ink3}>{sourceLabel}{onClick ? ' →' : ''}</L>
+          <L mono size={10} color={WF.ink3}>{anon(sourceLabel)}{onClick ? ' →' : ''}</L>
         )}
       </div>
       <L size={12} style={{ display: 'block', marginTop: 2, lineHeight: 1.45, whiteSpace: 'pre-wrap' }}>
-        {renderInline(a.annotation)}
+        {renderInline(anon(a.annotation))}
       </L>
     </div>
   );
@@ -2370,7 +2504,7 @@ function AnnotationsPanel({ annotations, style }) {
       <L size={12} weight={700} color={WF.ink2}>📝 what's being done</L>
       <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 8 }}>
         {annotations.map((a, i) => (
-          <AnnotationItem key={a.annotation_id || i} a={a} sourceLabel={a.agent_id} />
+          <AnnotationItem key={a.annotation_id || i} a={a} />
         ))}
       </div>
     </Box>
@@ -2383,6 +2517,7 @@ function AnnotationsPanel({ annotations, style }) {
 // semantic-areas screen.
 function ThreadsPanel({ threads, style }) {
   const { openThread } = useData();
+  const anon = useAnonymize();
   if (!threads || threads.length === 0) return null;
   return (
     <Box style={{ padding: 10, borderColor: WF.ink2, background: WF.panel, ...style }}>
@@ -2410,14 +2545,14 @@ function ThreadsPanel({ threads, style }) {
                   weight={600}
                   style={linkable ? { textDecoration: 'underline', textDecorationColor: WF.ink3 } : undefined}
                 >
-                  {t.label}
+                  {anon(t.label)}
                 </L>
                 {t.theme && <Chip>{t.theme}</Chip>}
                 {linkable && <L size={11} color={WF.ink3}>↗</L>}
               </div>
               {t.note && (
                 <L size={12} color={WF.ink2} style={{ display: 'block', marginTop: 2, lineHeight: 1.45, whiteSpace: 'pre-wrap' }}>
-                  {renderInline(t.note)}
+                  {renderInline(anon(t.note))}
                 </L>
               )}
             </button>
@@ -2545,6 +2680,7 @@ function findPaneFile(parsed, session) {
 // the same shared commit-diff parse the git-diff box uses. Sits between the
 // shell-context and git-diff boxes; the git-diff box's log table defers to it.
 function PaneOutputBox({ diff, panePath }) {
+  const anon = useAnonymize();
   const [full, setFull] = React.useState(false);
   const { status, parsed } = diff;
   const file = React.useMemo(
@@ -2567,7 +2703,7 @@ function PaneOutputBox({ diff, panePath }) {
     <Box style={{ padding: 10 }}>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
         <L size={12} weight={600}>output</L>
-        <L mono size={10} color={WF.ink3} style={{ wordBreak: 'break-all' }}>{file.path}</L>
+        <L mono size={10} color={WF.ink3} style={{ wordBreak: 'break-all' }}>{anon(file.path)}</L>
         {adds > 0 && <L mono size={11} color={WF.tagGreenFg}>+{adds}</L>}
         {dels > 0 && <L mono size={11} color={WF.heat4}>−{dels}</L>}
       </div>
@@ -2585,7 +2721,7 @@ function PaneOutputBox({ diff, panePath }) {
           the real file. The ↺ git checkout affordance lives in the dossier header. */}
       {bigLog && (
         <L mono size={10} color={WF.ink3} style={{ display: 'block', marginTop: 6, lineHeight: 1.45 }}>
-          {changed.length} changed lines — for close analysis, <strong style={{ color: WF.ink2 }}>↺ git checkout</strong> this commit (header above) and open <code>{file.path}</code> directly.
+          {changed.length} changed lines — for close analysis, <strong style={{ color: WF.ink2 }}>↺ git checkout</strong> this commit (header above) and open <code>{anon(file.path)}</code> directly.
         </L>
       )}
     </Box>
@@ -2618,10 +2754,10 @@ function DiffPanel({ sha, diff, panePath }) {
         <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 18 }}>
           {parsed.other.length > 0 && (
             <DiffGroup
-              title={parsed.logs.length > 0 ? 'other files' : 'files'}
               accent={WF.ink}
               files={parsed.other}
               sha={sha}
+              hideHeader
             />
           )}
           {/* Commit message and log artifacts sit below the diffs: the source
@@ -2700,6 +2836,7 @@ export function parseDiff(text) {
 // swatch, and a bold section title that is itself the collapse point — so the
 // commit message reads as a peer section of the diffs and log files below it.
 export function CommitHeader({ text }) {
+  const anon = useAnonymize();
   const [open, setOpen] = React.useState(false);
   return (
     <div>
@@ -2709,7 +2846,7 @@ export function CommitHeader({ text }) {
         style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: open ? 8 : 0, cursor: 'pointer', userSelect: 'none' }}
       >
         <L mono size={11} color={WF.ink2} style={{ width: 12, textAlign: 'center' }}>{open ? '▾' : '▸'}</L>
-        <div style={{ width: 12, height: 12, background: WF.ink3, border: inkBorder() }} />
+        <div style={{ width: 12, height: 12, background: WF.ink2, border: inkBorder() }} />
         <L size={13} weight={700}>commit message</L>
       </div>
       {open && (
@@ -2723,7 +2860,7 @@ export function CommitHeader({ text }) {
               lineHeight: 1.45,
               whiteSpace: 'pre-wrap',
             }}
-          >{text}</pre>
+          >{anon(text)}</pre>
         </Box>
       )}
     </div>
@@ -2745,7 +2882,7 @@ const TOTAL_LINES = 1200;    // summed hunk-body lines before files render as a 
 // caps at the file's actual length, i.e. "to the end of the file".
 const CTX_STEPS = [10, 25, 60, 150, 100000];
 
-export function DiffGroup({ title, accent, files, sha, oldSha, hint }) {
+export function DiffGroup({ title, accent, files, sha, oldSha, hint, hideHeader }) {
   // List mode: render every file as a collapsed header row (path + ±counts
   // + badges) so a heavy commit is a scannable list, not hundreds of open diffs.
   // Triggered by file count OR cumulative line count — many small files add up
@@ -2772,23 +2909,25 @@ export function DiffGroup({ title, accent, files, sha, oldSha, hint }) {
   const setAll = () => setOpenIdx(allOpen ? new Set() : new Set(files.map((_, i) => i)));
   return (
     <div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-        <div style={{ width: 12, height: 12, background: accent, border: inkBorder() }} />
-        <L size={13} weight={700}>{title}</L>
-        <Chip>{files.length}</Chip>
-        {hint && !listMode && <L mono size={10} color={WF.ink3}>· {hint}</L>}
-        {listMode && (
-          <L mono size={10} color={WF.ink3}>
-            · {files.length > MANY_FILES ? `${files.length} files` : `${totalLines} lines`} — collapsed, click to expand
-          </L>
-        )}
-        {files.length > 1 && (
-          <>
-            <div style={{ flex: 1 }} />
-            <Chip style={{ cursor: 'pointer' }} onClick={setAll}>{allOpen ? 'collapse all' : 'expand all'}</Chip>
-          </>
-        )}
-      </div>
+      {!hideHeader && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+          <div style={{ width: 12, height: 12, background: accent, border: inkBorder() }} />
+          <L size={13} weight={700}>{title}</L>
+          <Chip>{files.length}</Chip>
+          {hint && !listMode && <L mono size={10} color={WF.ink3}>· {hint}</L>}
+          {listMode && (
+            <L mono size={10} color={WF.ink3}>
+              · {files.length > MANY_FILES ? `${files.length} files` : `${totalLines} lines`} — collapsed, click to expand
+            </L>
+          )}
+          {files.length > 1 && (
+            <>
+              <div style={{ flex: 1 }} />
+              <Chip style={{ cursor: 'pointer' }} onClick={setAll}>{allOpen ? 'collapse all' : 'expand all'}</Chip>
+            </>
+          )}
+        </div>
+      )}
       <div style={{ display: 'flex', flexDirection: 'column', gap: listMode ? 6 : 14 }}>
         {files.map((f, i) => (
           <FileDiff
@@ -2851,6 +2990,7 @@ export function LogDiffTable({ files, hint, panePath }) {
 }
 
 function LogDiffRow({ file, first, border, isPane }) {
+  const anon = useAnonymize();
   const [full, setFull] = React.useState(false);
   const adds = file.body.filter((l) => /^\+[^+]/.test(l)).length;
   const dels = file.body.filter((l) => /^-[^-]/.test(l)).length;
@@ -2871,7 +3011,7 @@ function LogDiffRow({ file, first, border, isPane }) {
         {/* Path and counts share one line, so a single-line log diff is a
             single-line row (path · +1) rather than path-over-count. */}
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'baseline' }}>
-          <L mono size={11} weight={700} style={{ wordBreak: 'break-all' }}>{file.path}</L>
+          <L mono size={11} weight={700} style={{ wordBreak: 'break-all' }}>{anon(file.path)}</L>
           {adds > 0 && <L mono size={11} color={WF.tagGreenFg}>+{adds}</L>}
           {dels > 0 && <L mono size={11} color={WF.heat4}>−{dels}</L>}
           {bigLog && <Chip style={{ background: WF.tagAmberBg, borderColor: WF.tagAmberFg }}>large · {changed.length} lines</Chip>}
@@ -3037,6 +3177,7 @@ function getScrollParent(el) {
 export function FileDiff({ file, sha, oldSha, collapsible = false, open = false, onToggle, hideHeader = false }) {
   const { selectedInput } = useData();
   const { showLineNumbers } = useSettings();
+  const anon = useAnonymize();
   const [full, setFull] = React.useState(false); // opted into the full big-file body
   // Directional context expansion. `upIdx`/`downIdx` are null (committed ±3) or
   // an index into CTX_STEPS giving the lines to show above / below each hunk.
@@ -3295,7 +3436,7 @@ export function FileDiff({ file, sha, oldSha, collapsible = false, open = false,
         }}
       >
         {collapsible && <L mono size={11} color={WF.ink2}>{open ? '▾' : '▸'}</L>}
-        <L mono size={12} weight={700} style={{ wordBreak: 'break-all' }}>{file.path}</L>
+        <L mono size={12} weight={700} style={{ wordBreak: 'break-all' }}>{anon(file.path)}</L>
         <div style={{ flex: 1 }} />
         {!isImage && adds > 0 && <L mono size={11} color={WF.tagGreenFg}>+{adds}</L>}
         {!isImage && dels > 0 && <L mono size={11} color={WF.heat4}>−{dels}</L>}
@@ -3306,7 +3447,7 @@ export function FileDiff({ file, sha, oldSha, collapsible = false, open = false,
         {isDeleted && <Chip>deleted</Chip>}
         {file.meta.filter((l) => !/^(new file mode|deleted file mode)/.test(l)).length > 0 && (
           <L mono size={10} color={WF.ink3}>
-            {file.meta.filter((l) => !/^(new file mode|deleted file mode)/.test(l)).join(' · ')}
+            {anon(file.meta.filter((l) => !/^(new file mode|deleted file mode)/.test(l)).join(' · '))}
           </L>
         )}
       </div>
@@ -3543,6 +3684,7 @@ function GapBar({ count, expanding, onExpand }) {
 // GapBar *before* that line, and `onExpandGap(key)` fills it; both come from
 // FileDiff, which owns the gap state and the full-file fetch that backs it.
 export function ColoredDiffBody({ lines, maxHeight = 480, lineNumbers = false, gapAt = null, onExpandGap = null }) {
+  const anon = useAnonymize();
   const { nos, width } = React.useMemo(
     () => (lineNumbers ? computeLineNos(lines) : { nos: null, width: 0 }),
     [lines, lineNumbers],
@@ -3604,11 +3746,11 @@ export function ColoredDiffBody({ lines, maxHeight = 480, lineNumbers = false, g
           const row = lineNumbers ? (
             <div key={i} style={{ display: 'flex', background: bg }}>
               {gutter(nos[i])}
-              <span style={{ flex: 'none', padding: '0 6px', color }}>{line || ' '}</span>
+              <span style={{ flex: 'none', padding: '0 6px', color }}>{anon(line) || ' '}</span>
             </div>
           ) : (
             <span key={i} style={{ display: 'block', color, background: bg, padding: '0 6px' }}>
-              {line || ' '}
+              {anon(line) || ' '}
             </span>
           );
           if (!gap) return row;
@@ -3626,6 +3768,7 @@ export function ColoredDiffBody({ lines, maxHeight = 480, lineNumbers = false, g
 
 function FlagDetail({ flag, byId, onNavigate }) {
   const { showCommitHashes } = useSettings();
+  const anon = useAnonymize();
   const related = flag.related_sha;
   const relatedRow = related ? findCommitBySha(byId, related) : null;
   const desc = describeFlag(flag);
@@ -3633,14 +3776,14 @@ function FlagDetail({ flag, byId, onNavigate }) {
     <div>
       <L size={12} weight={700} color={WF.ink2}>{flag.kind}</L>
       <L size={12} color={WF.ink2} style={{ display: 'block', marginTop: 2 }}>{desc}</L>
-      {flag.path && <L mono size={11} color={WF.ink2} style={{ display: 'block', marginTop: 2 }}>{flag.path}</L>}
+      {flag.path && <L mono size={11} color={WF.ink2} style={{ display: 'block', marginTop: 2 }}>{anon(flag.path)}</L>}
       {relatedRow && (
         <div
           onClick={() => onNavigate(relatedRow.id)}
           style={{ marginTop: 4, display: 'inline-flex', gap: 6, alignItems: 'center', cursor: 'pointer' }}
         >
           <Chip>related →</Chip>
-          <L mono size={11}>{showCommitHashes ? `${related.slice(0, 7)} · ` : ''}{relatedRow.title}</L>
+          <L mono size={11}>{showCommitHashes ? `${related.slice(0, 7)} · ` : ''}{anon(relatedRow.title)}</L>
         </div>
       )}
     </div>
@@ -3661,6 +3804,7 @@ function describeFlag(flag) {
 }
 
 function RawLineDetail({ chunk, style }) {
+  const anon = useAnonymize();
   const rl = chunk.rawLine;
   if (!rl) {
     return (
@@ -3698,9 +3842,9 @@ function RawLineDetail({ chunk, style }) {
     const stderr = rl.response?.stderr || '';
     return (
       <Box style={{ padding: 10, ...style }}>
-        <L size={12} weight={600}>claude tool call · {rl.tool}</L>
+        <L size={12} weight={600}>claude tool call · {anon(rl.tool)}</L>
         {rl.input?.description && (
-          <L size={12} color={WF.ink2} style={{ display: 'block', marginTop: 4 }}>{rl.input.description}</L>
+          <L size={12} color={WF.ink2} style={{ display: 'block', marginTop: 4 }}>{anon(rl.input.description)}</L>
         )}
         <div style={{ marginTop: 8 }}>
           <L size={11} weight={600}>input</L>
@@ -3741,19 +3885,24 @@ function formatToolInput(input) {
 }
 
 function KV({ k, v }) {
+  const anon = useAnonymize();
   if (v == null || v === '') return null;
+  // The key (k) is a static field label — chrome — so only the value is anon'd.
   return (
     <div style={{ display: 'flex', gap: 8, marginTop: 4, alignItems: 'baseline' }}>
       <L mono size={10} color={WF.ink3} style={{ minWidth: 80 }}>{k}</L>
-      <L mono size={11} color={WF.ink2} style={{ overflowWrap: 'anywhere' }}>{v}</L>
+      <L mono size={11} color={WF.ink2} style={{ overflowWrap: 'anywhere' }}>{anon(v)}</L>
     </div>
   );
 }
 
 function Pre({ children, limit = 4000 }) {
+  const anon = useAnonymize();
   const s = typeof children === 'string' ? children : String(children ?? '');
   const truncated = s.length > limit;
-  const body = truncated ? s.slice(0, limit) + '\n…' : s;
+  // Scramble after truncation so the limit is measured against the real length;
+  // scrambleText preserves length, so the cut lands identically either way.
+  const body = anon(truncated ? s.slice(0, limit) + '\n…' : s);
   return (
     <pre
       style={{

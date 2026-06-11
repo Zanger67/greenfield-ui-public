@@ -38,14 +38,34 @@ const REPO_PARENT = path.resolve(__dirname, '..');
 // write: the auditor's own items (user/) and review status (status/), plus the
 // rendered digest. The local_ai/ subdir is owned by the agent, never written here.
 const AUDIT_SUBDIR = 'audit';
+// The append-only UI activity log — a peer of user/ + status/, but written by a
+// different endpoint (POST /api/audit-log) that APPENDS rather than overwrites.
+// One fixed relative path (so it never takes attacker-controlled path input); it
+// holds the chronological stream of auditor actions the running UI emits.
+const ACTIVITY_LOG = 'activity/activity.jsonl';
 const AUDIT_FILES = new Set([
+  'manifest.json',
+  'items/commits.jsonl',
+  'items/threads.jsonl',
+  'items/areas.jsonl',
+  'items/files.jsonl',
+  'items/plots.jsonl',
+  'items/sidecar_groups.jsonl',
+  'groups/user_groups.jsonl',
+  'status/dismissals.jsonl',
+  'status/coverage.json',
+  'AI_AUDIT.md',
+]);
+// Pre-schema-v2 paths, removed on every write so a stale mirror from the old
+// layout can't linger beside the new items/ store and mislead the agent. Fixed
+// constant list (never attacker-controlled), joined under the resolved audit dir
+// exactly like the allowlist — so path.join can't escape.
+const LEGACY_AUDIT_FILES = [
   'user/user_flags.jsonl',
   'user/user_notes.jsonl',
   'user/user_groups.jsonl',
   'status/user_dismissals.jsonl',
-  'status/coverage.json',
-  'AI_AUDIT.md',
-]);
+];
 
 const SHA_RE = /^[0-9a-f]{7,40}$/;
 // Input names index a folder under public/data, so reject path separators and
@@ -142,13 +162,15 @@ function discoverInputs() {
   const inputs = entries
     .filter((e) => e.isDirectory() && NAME_RE.test(e.name)
       && fs.existsSync(path.join(PUBLIC_DATA, e.name, 'metadata.json')))
-    .map((e) => ({ name: e.name, label: readUiName(path.join(PUBLIC_DATA, e.name)) || e.name }));
+    .map((e) => ({ name: e.name, label: readUiName(path.join(PUBLIC_DATA, e.name)) || e.name, source: 'public/data' }));
   // The surrounding trace joins the public/data traces as a peer. Skip it only
   // when a dropped trace already claims the same name (public/data owns path
-  // resolution for a name collision; see resolveRepo).
+  // resolution for a name collision; see resolveRepo). `source` tells the client
+  // where the trace's files sit on disk — public/data/<name>/ vs the parent (../) —
+  // so handoff prompts can name that location for the coding agent (see traceLocation).
   const parent = parentTraceInput();
   if (parent && !inputs.some((i) => i.name === parent.name)) {
-    inputs.push({ name: parent.name, label: readUiName(parent.dir) || parent.name });
+    inputs.push({ name: parent.name, label: readUiName(parent.dir) || parent.name, source: 'parent' });
   }
   inputs.sort((a, b) =>
     a.label.toLowerCase().localeCompare(b.label.toLowerCase()) || a.name.localeCompare(b.name));
@@ -409,6 +431,13 @@ function checkoutMiddleware() {
               fs.writeFileSync(dest, content);
               written.push(rel);
             }
+            // Prune the pre-v2 layout: the endpoint never deletes files absent
+            // from the payload, so without this the old user/ + status mirror
+            // would persist next to the new store. force:true = no throw if absent.
+            for (const rel of LEGACY_AUDIT_FILES) {
+              fs.rmSync(path.join(dir, rel), { force: true });
+            }
+            try { fs.rmdirSync(path.join(dir, 'user')); } catch { /* not empty / already gone */ }
           } catch (err) {
             res.statusCode = 500;
             return res.end(JSON.stringify({ ok: false, error: err.message }));
@@ -416,6 +445,63 @@ function checkoutMiddleware() {
           // Report the dir relative to the UI root: public/data/<name>/audit for a
           // dropped trace, ../audit for the self-hosted parent trace.
           res.end(JSON.stringify({ ok: true, dir: path.relative(__dirname, dir), written }));
+        });
+      });
+
+      // POST /api/audit-log — body { name, events: [ {...}, ... ] }.
+      // The append-only companion to /api/audit: instead of overwriting the
+      // state mirror, this APPENDS each event as one JSONL line to the trace's
+      // own <traceDir>/audit/activity/activity.jsonl (a single fixed path, never
+      // attacker-controlled — see ACTIVITY_LOG). It's the chronological record of
+      // what the auditor did (navigation, flags, notes, tags, settings, copies);
+      // the UI batches a burst of actions into one request. Bounded: the body is
+      // capped while reading and the batch is capped before writing, so a runaway
+      // client can't write unbounded data.
+      server.middlewares.use('/api/audit-log', (req, res) => {
+        if (req.method !== 'POST') { res.statusCode = 405; return res.end(); }
+        let body = '';
+        let tooBig = false;
+        req.on('data', (c) => {
+          body += c;
+          if (body.length > 1_000_000) { tooBig = true; req.destroy(); }
+        });
+        req.on('end', () => {
+          res.setHeader('content-type', 'application/json');
+          if (tooBig) { res.statusCode = 413; return res.end(JSON.stringify({ ok: false, error: 'too large' })); }
+          let parsed;
+          try { parsed = JSON.parse(body); }
+          catch { res.statusCode = 400; return res.end(JSON.stringify({ ok: false, error: 'bad json' })); }
+          const { name, events } = parsed || {};
+          if (typeof name !== 'string' || !NAME_RE.test(name)) {
+            res.statusCode = 400; return res.end(JSON.stringify({ ok: false, error: 'bad name' }));
+          }
+          if (!Array.isArray(events)) {
+            res.statusCode = 400; return res.end(JSON.stringify({ ok: false, error: 'bad events' }));
+          }
+          const traceDir = resolveTraceDir(name);
+          if (!traceDir) {
+            res.statusCode = 404;
+            return res.end(JSON.stringify({ ok: false, error: `no trace dir for '${name}'` }));
+          }
+          // Re-serialize each event ourselves (one compact line apiece) rather
+          // than trust the client's framing — guarantees well-formed JSONL and a
+          // single trailing newline per record. Cap the batch as a backstop.
+          let lines = '';
+          let appended = 0;
+          for (const ev of events.slice(0, 1000)) {
+            if (!ev || typeof ev !== 'object') continue;
+            try { lines += JSON.stringify(ev) + '\n'; appended++; }
+            catch { /* non-serializable event — skip it */ }
+          }
+          const dest = path.join(traceDir, AUDIT_SUBDIR, ACTIVITY_LOG);
+          try {
+            fs.mkdirSync(path.dirname(dest), { recursive: true });
+            if (lines) fs.appendFileSync(dest, lines);
+          } catch (err) {
+            res.statusCode = 500;
+            return res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+          res.end(JSON.stringify({ ok: true, file: path.relative(__dirname, dest), appended }));
         });
       });
 

@@ -4,16 +4,17 @@
 import React from 'react';
 import { WF, inkBorder, L, LoadingBox } from './primitives.jsx';
 import { DataProvider, useData } from './dataStore.jsx';
-import { SettingsProvider } from './settings.jsx';
+import { SettingsProvider, useAnonymize } from './settings.jsx';
 import { WireDossierInbox } from './WireDossierInbox.jsx';
 import { WireOverview } from './WireOverview.jsx';
 import { WireSemanticAreas } from './WireSemanticAreas.jsx';
 import { WireResults } from './WireResults.jsx';
+import { WireReadme } from './WireReadme.jsx';
 
 export const SCREENS = [
   { id: 'dossier',  label: 'timeline' },
   { id: 'areas',    label: 'threads & groups' },
-  { id: 'results',  label: 'final results' },
+  { id: 'results',  label: 'docs & final results' },
   { id: 'overview', label: 'overview' },
 ];
 
@@ -30,6 +31,7 @@ export const CheckoutContext = React.createContext({
 
 function InputSelector() {
   const { inputs, selectedInput, selectInput } = useData();
+  const anon = useAnonymize();
   if (!inputs || inputs.length === 0) return null;
   return (
     <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
@@ -48,7 +50,7 @@ function InputSelector() {
         }}
       >
         {inputs.map((i) => (
-          <option key={i.name} value={i.name}>{i.label || i.name}</option>
+          <option key={i.name} value={i.name}>{anon(i.label || i.name)}</option>
         ))}
       </select>
     </label>
@@ -100,7 +102,11 @@ function Screen() {
 }
 
 function LoadingOrError() {
-  const { status, error } = useData();
+  const { status, error, screen } = useData();
+  // The help/readme screen is app documentation, not trace-derived — render it
+  // ahead of the load/error gate so the `?` button works even before (or
+  // regardless of whether) a trace has loaded.
+  if (screen === 'help') return <WireReadme />;
   if (status === 'loading') {
     return (
       <div style={{ padding: 40 }}>

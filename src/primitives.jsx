@@ -3,6 +3,7 @@
 // ink strokes, handwritten headings, mono for code/labels, no SVG icons —
 // [bracket] mono tags as placeholders instead.
 import React from 'react';
+import { logActivity } from './activityLog.js';
 
 // Colours are CSS custom properties, not literal hex — the actual light/dark
 // values live in index.html under :root / :root[data-theme="dark"]. Because
@@ -76,14 +77,60 @@ export const heat = (n) => [WF.heat0, WF.heat1, WF.heat2, WF.heat3, WF.heat4][Ma
 
 export const inkBorder = (w = 1.5) => `${w}px solid ${WF.border}`;
 
-export function L({ children, size = 13, mono = false, color, style = {}, weight = 400, onClick, title }) {
+// ── Anonymous-mode text scramble ────────────────────────────────────────────
+// Shape-preserving de-identification for the `anonymize` setting (settings.jsx).
+// Every letter is replaced with a pseudo-random letter (case kept) and every
+// digit with a pseudo-random digit; whitespace, punctuation, and all other
+// glyphs pass through verbatim. That last rule is what makes a whole-string
+// scramble safe to apply blindly: the diff `+`/`-`/`@@` gutters, markdown
+// `**`/`` ` ``/`#` markers, code indentation and operators, and path separators
+// are all non-alphanumeric, so they survive — scrambled code still reads as
+// code, a scrambled path still reads as a path, scrambled markdown still
+// renders bold/lists/headings.
+//
+// The mapping is DETERMINISTIC in (charCode, position): the same input always
+// produces the same output, so there is no shimmer across re-renders and an
+// identical string (e.g. a file path shown in a row and again in a diff header)
+// scrambles to the same thing everywhere. It is a privacy screen for
+// screenshots / screen-shares / external demos, NOT a cipher — it only has to
+// stop a real name, path, or code line from being read off the screen. The
+// underlying data is never touched (this runs at render time), so navigation,
+// git lookups, filters, and the AI_AUDIT.md export keep working on real values.
+const SCRAMBLE_LOWER = 'abcdefghijklmnopqrstuvwxyz';
+const SCRAMBLE_UPPER = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+const SCRAMBLE_DIGITS = '0123456789';
+
+export function scrambleText(input) {
+  if (input == null) return input;
+  const str = String(input);
+  let out = '';
+  for (let i = 0; i < str.length; i += 1) {
+    const c = str.charCodeAt(i);
+    // A small integer hash of (charCode, index) → a stable pseudo-random pick.
+    // The trailing `>>> 0` is load-bearing: `^` yields a SIGNED int32, so without
+    // it `h % 26` could go negative and index past the alphabet (→ undefined,
+    // which would also break length preservation). Coerce back to unsigned first.
+    let h = (Math.imul(c, 2654435761) + Math.imul(i + 1, 40503) + 0x9e3779b9) >>> 0;
+    h ^= h >>> 15; h = Math.imul(h, 2246822519) >>> 0; h ^= h >>> 13;
+    h >>>= 0;
+    if (c >= 97 && c <= 122) out += SCRAMBLE_LOWER[h % 26];        // a–z
+    else if (c >= 65 && c <= 90) out += SCRAMBLE_UPPER[h % 26];    // A–Z
+    else if (c >= 48 && c <= 57) out += SCRAMBLE_DIGITS[h % 10];   // 0–9
+    else out += str[i];                                            // keep verbatim
+  }
+  return out;
+}
+
+export function L({ children, size = 13, mono = false, color, style = {}, weight = 400, onClick, title, id }) {
   // onClick / title are forwarded: several call sites style an <L> as a link
   // (cursor:pointer, dotted underline) and pass onClick to navigate — e.g. the
   // "open →" commit link and the auditor-comment labels on the areas screen.
   // Without forwarding, those handlers were silently dropped and the links did
-  // nothing. title drives the hover tooltips a few <L>s ask for.
+  // nothing. title drives the hover tooltips a few <L>s ask for. `id` lets a
+  // heading carry a slug anchor so in-page `#…` Markdown links can scroll to it.
   return (
     <span
+      id={id}
       onClick={onClick}
       title={title}
       style={{
@@ -127,6 +174,10 @@ const mdCodeStyle = {
   border: `1px solid ${WF.rule}`,
   borderRadius: 3,
   padding: '0 3px',
+  // Preserve internal spacing of a code span even when the surrounding block
+  // collapses whitespace (the block Markdown paragraphs use white-space: normal
+  // for CommonMark soft-break behaviour — see MdBlock).
+  whiteSpace: 'pre-wrap',
 };
 
 // Fenced (```) block inside the inline flow. Rendered as a `display: block`
@@ -146,7 +197,13 @@ const mdFenceStyle = {
   lineHeight: 1.5,
 };
 
-export function renderInline(text, keyPrefix = 'md') {
+// `opts.links` opts into `[text](href)` link parsing (off by default, so the
+// agent-commentary callers are unchanged and a bracket in a comment stays
+// literal). The block-level `Markdown` passes it on, with an optional
+// `opts.onLink(href)` the host uses to intercept navigation (e.g. the help page
+// opening AGENTS.md in-app). `![…](…)` images are left to the block layer, so a
+// `[` preceded by `!` is skipped here.
+export function renderInline(text, keyPrefix = 'md', opts = null) {
   if (text == null) return text;
   const str = String(text);
   const nodes = [];
@@ -174,14 +231,23 @@ export function renderInline(text, keyPrefix = 'md') {
     } else if ((m = /^\*\*\*(?!\s)([^\n]+?)\*\*\*/.exec(rest))) {
       flush();
       nodes.push(
-        <strong key={`${keyPrefix}-${key++}`}><em>{renderInline(m[1], `${keyPrefix}-${key}bi`)}</em></strong>
+        <strong key={`${keyPrefix}-${key++}`}><em>{renderInline(m[1], `${keyPrefix}-${key}bi`, opts)}</em></strong>
       );
     } else if ((m = /^\*\*(?!\s)([\s\S]+?)\*\*/.exec(rest))) {
       flush();
-      nodes.push(<strong key={`${keyPrefix}-${key++}`}>{renderInline(m[1], `${keyPrefix}-${key}b`)}</strong>);
+      nodes.push(<strong key={`${keyPrefix}-${key++}`}>{renderInline(m[1], `${keyPrefix}-${key}b`, opts)}</strong>);
     } else if ((m = /^\*(?!\s)([^*\n]+?)\*/.exec(rest))) {
       flush();
-      nodes.push(<em key={`${keyPrefix}-${key++}`}>{renderInline(m[1], `${keyPrefix}-${key}i`)}</em>);
+      nodes.push(<em key={`${keyPrefix}-${key++}`}>{renderInline(m[1], `${keyPrefix}-${key}i`, opts)}</em>);
+    } else if (opts?.links && str[i - 1] !== '!' && (m = /^\[([^\]]+)\]\(([^)\s]+)\)/.exec(rest))) {
+      // Inline link `[label](href)`. The label keeps inline emphasis; the host's
+      // onLink (if any) decides what the href does.
+      flush();
+      nodes.push(
+        <MdLink key={`${keyPrefix}-${key++}`} href={m[2]} onLink={opts.onLink}>
+          {renderInline(m[1], `${keyPrefix}-${key}lk`, opts)}
+        </MdLink>
+      );
     } else {
       buf += str[i];
       i += 1;
@@ -282,6 +348,10 @@ export function useCopy(text, holdMs = 1300) {
       if (timer.current) clearTimeout(timer.current);
       timer.current = setTimeout(() => setCopied(false), holdMs);
     };
+    // The single chokepoint for every copy-to-clipboard affordance (the handoff
+    // CopyBlock, CopyTitle/Tag/Text reference copies). Record that a copy happened
+    // and a short preview — not the whole payload, which can be a large diff/ref.
+    logActivity('copy', { chars: (value || '').length, preview: String(value || '').slice(0, 80) });
     try {
       if (navigator.clipboard?.writeText) navigator.clipboard.writeText(value).then(mark, mark);
       else throw new Error('no clipboard');
@@ -298,15 +368,39 @@ export function useCopy(text, holdMs = 1300) {
   return { copied, copy };
 }
 
-// Compose a compact, paste-ready reference line for handing one target off to a
-// coding agent: what it is, the id that joins it onto the metadata sidecars, and
-// its associated commit hashes. Terse on purpose so it drops cleanly into a
-// Claude Code prompt alongside AGENTS.md.
-export function refStatement({ kind, label, idField, id, shas = [] }) {
-  const list = (shas || []).filter(Boolean);
-  const idPart = id ? ` — ${idField}: ${id}` : '';
-  const shaPart = list.length ? ` · commit hash${list.length === 1 ? '' : 'es'}: ${list.join(', ')}` : '';
-  return `${kind} "${label}"${idPart}${shaPart}. See the UI's AGENTS.md to navigate the metadata sidecars and codebase/ git history.`;
+// Leading frame on every paste-ready handoff prompt, so a coding agent knows the
+// line it's reading is a pointer handed off from the trace's audit UI (not the
+// human typing free-form). Single source of truth — `refStatement` and the
+// WireSemanticAreas CopyBlock prompts all lead with it; tweak the wording here.
+export const UI_HANDOFF_PREFIX = "Investigation context from the trace's audit UI. ";
+
+// One short clause — placed right after UI_HANDOFF_PREFIX in every handoff prompt
+// — naming the trace and where its files sit on disk, so the coding agent knows
+// which dir to resolve the pointer against. `trace` is the manifest entry
+// ({ name, source }) from the store's `currentTrace`: source 'parent' means the
+// surrounding trace served from ../, anything else means public/data/<name>/
+// (the same convention AGENTS.md uses). Returns '' if no trace is known.
+export function traceLocation(trace) {
+  if (!trace || !trace.name) return '';
+  const loc = trace.source === 'parent' ? '../ (relative to the ui dir)' : `public/data/${trace.name}/`;
+  return `Trace ${trace.name} at ${loc}. `;
+}
+
+// Compose a compact, paste-ready *pointer* for handing one target off to a coding
+// agent. It carries the audit-store `target_key` (the join key into <trace>/audit/),
+// NOT the target's annotations — and, for a multi-commit target (thread / area /
+// sidecar group), NOT the commit-hash dump either. The agent resolves the members,
+// the hashes, and the auditor's notes by following the pointer; the *how* (the
+// `expand(anchor)` procedure, which jsonl files to read, the jq queries) lives in
+// AGENTS.md, deliberately kept out of this prompt so it stays short. A single commit
+// also carries its `inner_commit_sha` inline.
+export function refStatement({ kind, label, targetKey, sha = null, single = false, detail = null, trace = null }) {
+  const ptr = targetKey ? ` — audit pointer ${targetKey}` : '';
+  const git = single && sha ? ` · inner_commit_sha ${sha}` : '';
+  // For a group handoff, `detail` carries its scope at a glance — type, commit
+  // count, first…last sha — so the agent can confirm it resolved the right thing.
+  const det = detail ? ` · ${detail}` : '';
+  return `${UI_HANDOFF_PREFIX}${traceLocation(trace)}${kind} "${label}"${ptr}${git}${det}. Resolve it via the schema in the UI's AGENTS.md.`;
 }
 
 // A monospace, copy-to-clipboard block: clicking the text OR the corner button
@@ -346,8 +440,8 @@ export function CopyBlock({ text, label = 'copy', title = 'click to copy', size 
 // A heading that copies a reference statement when clicked. The visible text is
 // the title; `copyText` (string or thunk) is the paste-ready statement. A subtle
 // "copy refs" hint fades in on hover, swapped for "copied ✓" after a click. Use
-// on static titles (commit / area / thread); for an editable title field use
-// CopyChip beside it instead.
+// on static titles (commit / area / thread); an editable title (e.g. a user
+// group's rename field) relies on its handoff CopyBlock instead.
 export function CopyTitle({ children, copyText, size = 18, weight = 700, mono = false, color = WF.ink, hint = '⧉ copy refs', title = 'click to copy references', style = {} }) {
   const { copied, copy } = useCopy(copyText);
   const [hover, setHover] = React.useState(false);
@@ -376,19 +470,42 @@ export function CopyTitle({ children, copyText, size = 18, weight = 700, mono = 
   );
 }
 
-// A Chip that copies `text` on click, flashing "copied ✓". For an inline "copy
-// references" affordance next to a title that is itself not clickable (e.g. the
-// editable group-name field).
-export function CopyChip({ text, label = '⧉ copy refs', title = 'copy references', style = {} }) {
-  const { copied, copy } = useCopy(text);
+// A classification Chip that doubles as a copy-references affordance: clicking the
+// badge copies the same paste-ready statement a CopyTitle would, so the auditor
+// can grab a target's refs from its "▦ data commit group" / "▣ data" / "~ modify"
+// classification as well as its title. Keeps the badge's own semantic fill
+// (passed through `style`); flashes the border to WF.add on copy as confirmation.
+export function CopyTag({ children, copyText, title = 'click to copy references', style = {} }) {
+  const { copied, copy } = useCopy(copyText);
   return (
     <Chip
       onClick={copy}
-      title={title}
-      color={copied ? WF.add : WF.ink2}
-      bg={WF.paperAlt}
-      style={{ cursor: 'pointer', ...style }}
-    >{copied ? 'copied ✓' : label}</Chip>
+      title={copied ? 'copied ✓' : title}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); copy(e); } }}
+      style={{ cursor: 'pointer', transition: 'border-color 0.15s', ...style, ...(copied ? { borderColor: WF.add } : {}) }}
+    >{children}</Chip>
+  );
+}
+
+// A plain clickable text line that copies `copyText` on click, flashing its own
+// ink to WF.add as confirmation. Unlike CopyTitle it adds no hover hint, so it
+// suits a describing subline or a metadata label (e.g. the "audit" / "commands"
+// source word) that should copy the same reference as its header's title but
+// confirm on its own line only — each instance owns its flash.
+export function CopyText({ children, copyText, size = 13, mono = false, weight = 400, color = WF.ink2, title = 'click to copy references', style = {} }) {
+  const { copied, copy } = useCopy(copyText);
+  return (
+    <L
+      mono={mono}
+      size={size}
+      weight={weight}
+      color={copied ? WF.add : color}
+      onClick={copy}
+      title={copied ? 'copied ✓' : title}
+      style={{ cursor: 'pointer', transition: 'color 0.15s', ...style }}
+    >{children}</L>
   );
 }
 
@@ -743,6 +860,20 @@ export function MiniTimeline({ heats = [], cursor = 0, visited = [], related, st
 // Inline emphasis inside every block still flows through `renderInline`, so the
 // underscore-is-literal / asterisk-only rules hold here too.
 //
+// A GFM table separator row: `| --- | :---: | ---: |` — pipes around cells of
+// dashes with optional leading/trailing colons (alignment). Used to confirm the
+// line *above* is a header row before committing to table parsing.
+const mdTableSep = (s) => /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)*\|?\s*$/.test(s);
+// Split one table row into trimmed cells, dropping the optional outer pipes.
+// Plain split on `|` (no escaped-pipe handling) — fine for the trace docs and
+// this app's README, none of which carry literal pipes inside a cell.
+const mdSplitRow = (s) => {
+  let t = s.trim();
+  if (t.startsWith('|')) t = t.slice(1);
+  if (t.endsWith('|')) t = t.slice(0, -1);
+  return t.split('|').map((c) => c.trim());
+};
+
 // `resolveImg(src)` maps a relative image path to a URL (e.g. into the trace's
 // data dir). Without it, an image renders its src verbatim. Most trace docs
 // reference figures as backticked filenames rather than `![](…)` image syntax,
@@ -778,11 +909,35 @@ function parseMdBlocks(src) {
     if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { flushPara(); blocks.push({ type: 'hr' }); i += 1; continue; }
     const img = /^\s*!\[([^\]]*)\]\(([^)\s]+)\)\s*$/.exec(line);
     if (img) { flushPara(); blocks.push({ type: 'image', alt: img[1], src: img[2] }); i += 1; continue; }
+    // GFM table: a pipe-bearing header row immediately followed by a separator
+    // row of dashes. Consume contiguous pipe rows as the body. Checked before
+    // the quote/list/para fallbacks so the pipes don't render literally.
+    if (line.includes('|') && i + 1 < lines.length && mdTableSep(lines[i + 1])) {
+      flushPara();
+      const header = mdSplitRow(line);
+      const aligns = mdSplitRow(lines[i + 1]).map((c) => {
+        const l = c.startsWith(':'); const r = c.endsWith(':');
+        return l && r ? 'center' : r ? 'right' : l ? 'left' : null;
+      });
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].includes('|') && !/^\s*$/.test(lines[i])) {
+        rows.push(mdSplitRow(lines[i]));
+        i += 1;
+      }
+      blocks.push({ type: 'table', header, aligns, rows });
+      continue;
+    }
     if (/^\s*>\s?/.test(line)) {
       flushPara();
       const body = [];
       while (i < lines.length && /^\s*>\s?/.test(lines[i])) { body.push(lines[i].replace(/^\s*>\s?/, '')); i += 1; }
-      blocks.push({ type: 'quote', text: body.join('\n') });
+      // GitHub callout: a leading `[!TIP]` / `[!NOTE]` / `[!WARNING]` … marker
+      // promotes the blockquote to a labeled callout box; the marker line is
+      // consumed and the type carried on the block.
+      const co = /^\[!(\w+)\]\s*$/.exec(body[0] || '');
+      if (co) blocks.push({ type: 'quote', callout: co[1].toUpperCase(), text: body.slice(1).join('\n') });
+      else blocks.push({ type: 'quote', text: body.join('\n') });
       continue;
     }
     if (listRe.test(line)) {
@@ -818,12 +973,64 @@ function parseMdBlocks(src) {
 
 const MD_HEADING_SIZE = { 1: 23, 2: 18, 3: 15, 4: 13, 5: 12, 6: 12 };
 
-function MdBlock({ block, resolveImg }) {
+// GitHub callout types → display label + accent (theme-aware tag foregrounds).
+const MD_CALLOUT = {
+  NOTE: { label: 'Note', color: WF.tagBlueFg },
+  TIP: { label: 'Tip', color: WF.tagGreenFg },
+  IMPORTANT: { label: 'Important', color: WF.tagPurpleFg },
+  WARNING: { label: 'Warning', color: WF.tagAmberFg },
+  CAUTION: { label: 'Caution', color: WF.tagRedFg },
+};
+
+// GitHub-style heading slug: lowercase, drop everything but word chars / spaces /
+// hyphens (so backticks and punctuation in a heading don't leak into the anchor),
+// then spaces → hyphens. "Settings reference" → "settings-reference". Used as the
+// heading element id so a `#…` Markdown link can scroll to it.
+const mdSlug = (s) =>
+  String(s).toLowerCase().replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '-');
+
+// Inline `[label](href)` link. With an `onLink` host handler, navigation is fully
+// delegated (default suppressed) — the help page uses it to open AGENTS.md in-app,
+// smooth-scroll `#` anchors, and send external URLs to a new tab. Without one,
+// external hrefs open in a new tab and other hrefs fall back to native `<a>`.
+function MdLink({ href, onLink, children }) {
+  const external = /^(https?:|mailto:)/i.test(href) || href.startsWith('//');
+  const handleClick = (e) => {
+    if (onLink) { e.preventDefault(); onLink(href, e); }
+  };
+  return (
+    <a
+      href={href}
+      onClick={handleClick}
+      target={external && !onLink ? '_blank' : undefined}
+      rel={external ? 'noopener noreferrer' : undefined}
+      style={{ color: WF.tagBlueFg, textDecoration: 'underline', textUnderlineOffset: '0.15em', cursor: 'pointer' }}
+    >
+      {children}
+    </a>
+  );
+}
+
+// `scale` multiplies every font size this block controls (default 1 — unchanged
+// for the trace-doc viewer); the readme/help page passes a value > 1 for a
+// roomier read. Inline `<code>` is sized in `em`, so it tracks the scaled parent
+// automatically. `imgFill` makes images take the full content width (so the text
+// column and the figure render at exactly the same width) instead of merely
+// capping at it — used by the readme page, where the GIFs should line up with
+// the prose regardless of their intrinsic pixel size. `onLink` is threaded into
+// every inline render so `[…](…)` links are clickable (see renderInline opts).
+function MdBlock({ block, resolveImg, scale = 1, imgFill = false, onLink }) {
+  const sz = (n) => Math.round(n * scale);
+  // Every inline render in this block opts into link parsing and shares the host
+  // link handler; emphasis/code behaviour is otherwise unchanged. (Named `inl`,
+  // not `ri`, to avoid shadowing the table-row index `ri` used below.)
+  const inl = (t) => renderInline(t, 'md', { links: true, onLink });
   if (block.type === 'heading') {
     const size = MD_HEADING_SIZE[block.level] || 13;
     return (
       <L
-        size={size}
+        id={mdSlug(block.text)}
+        size={sz(size)}
         weight={700}
         color={block.level >= 4 ? WF.ink2 : WF.ink}
         style={{
@@ -833,7 +1040,7 @@ function MdBlock({ block, resolveImg }) {
           borderBottom: block.level === 1 ? inkBorder(1.5) : undefined,
         }}
       >
-        {renderInline(block.text)}
+        {inl(block.text)}
       </L>
     );
   }
@@ -848,7 +1055,7 @@ function MdBlock({ block, resolveImg }) {
           background: WF.paperAlt,
           border: inkBorder(1.2),
           fontFamily: WF.monoFont,
-          fontSize: 12,
+          fontSize: sz(12),
           lineHeight: 1.5,
           color: WF.ink,
           whiteSpace: 'pre',
@@ -860,13 +1067,69 @@ function MdBlock({ block, resolveImg }) {
   }
   if (block.type === 'image') {
     const src = resolveImg ? resolveImg(block.src) : block.src;
-    return <img src={src} alt={block.alt} style={{ maxWidth: '100%', border: inkBorder(1.2) }} />;
+    // Animated GIFs play and loop on their own in an <img>; nothing extra is
+    // needed for autoplay. The alt text doubles as a caption when present.
+    return (
+      <figure style={{ margin: 0, display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'flex-start' }}>
+        <img
+          src={src}
+          alt={block.alt}
+          loading="lazy"
+          style={{ width: imgFill ? '100%' : undefined, maxWidth: '100%', border: inkBorder(1.2) }}
+        />
+        {block.alt && (
+          <figcaption><L size={sz(11)} mono color={WF.ink3}>{block.alt}</L></figcaption>
+        )}
+      </figure>
+    );
+  }
+  if (block.type === 'table') {
+    const cellBase = { border: inkBorder(1.2), padding: '6px 10px', verticalAlign: 'top' };
+    return (
+      <div style={{ overflowX: 'auto' }}>
+        <table style={{ borderCollapse: 'collapse', width: '100%', fontFamily: WF.bodyFont, fontSize: sz(13) }}>
+          <thead>
+            <tr>
+              {block.header.map((h, j) => (
+                <th key={j} style={{ ...cellBase, textAlign: block.aligns[j] || 'left', background: WF.paperAlt, color: WF.ink, fontWeight: 700 }}>
+                  {inl(h)}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {block.rows.map((r, ri) => (
+              <tr key={ri}>
+                {block.header.map((_, j) => (
+                  <td key={j} style={{ ...cellBase, textAlign: block.aligns[j] || 'left', color: WF.ink2 }}>
+                    {inl(r[j] ?? '')}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
   }
   if (block.type === 'quote') {
+    if (block.callout) {
+      const c = MD_CALLOUT[block.callout] || { label: block.callout, color: WF.ink2 };
+      return (
+        <div style={{ border: inkBorder(1.2), borderLeft: `4px solid ${c.color}`, background: WF.paperAlt, padding: '8px 12px' }}>
+          <L mono size={sz(10)} weight={700} color={c.color} style={{ display: 'block', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>
+            {c.label}
+          </L>
+          <L size={sz(13)} color={WF.ink2} style={{ display: 'block', whiteSpace: 'normal', lineHeight: 1.5 }}>
+            {inl(block.text)}
+          </L>
+        </div>
+      );
+    }
     return (
       <div style={{ borderLeft: `4px solid ${WF.rule}`, paddingLeft: 12 }}>
-        <L size={13} color={WF.ink2} style={{ display: 'block', whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>
-          {renderInline(block.text)}
+        <L size={sz(13)} color={WF.ink2} style={{ display: 'block', whiteSpace: 'normal', lineHeight: 1.5 }}>
+          {inl(block.text)}
         </L>
       </div>
     );
@@ -879,27 +1142,30 @@ function MdBlock({ block, resolveImg }) {
             key={i}
             style={{ display: 'flex', gap: 8, paddingLeft: 2 + Math.floor((it.indent || 0) / 2) * 16 }}
           >
-            <L mono size={13} color={WF.ink3} style={{ flexShrink: 0, minWidth: it.ordered ? 18 : 8 }}>
+            <L mono size={sz(13)} color={WF.ink3} style={{ flexShrink: 0, minWidth: it.ordered ? 18 : 8 }}>
               {it.ordered ? it.marker : '•'}
             </L>
-            <L size={13} style={{ whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>{renderInline(it.text)}</L>
+            <L size={sz(13)} style={{ whiteSpace: 'normal', lineHeight: 1.5 }}>{inl(it.text)}</L>
           </div>
         ))}
       </div>
     );
   }
   return (
-    <L size={13} style={{ display: 'block', whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>
-      {renderInline(block.text)}
+    // Paragraph: white-space:normal so a single source newline is a CommonMark
+    // soft break (collapses to a space) and only a blank line — which the parser
+    // already turns into a separate block — starts a new paragraph.
+    <L size={sz(13)} style={{ display: 'block', whiteSpace: 'normal', lineHeight: 1.5 }}>
+      {inl(block.text)}
     </L>
   );
 }
 
-export function Markdown({ text, resolveImg, style = {} }) {
+export function Markdown({ text, resolveImg, style = {}, scale = 1, imgFill = false, onLink }) {
   const blocks = React.useMemo(() => parseMdBlocks(text || ''), [text]);
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10, ...style }}>
-      {blocks.map((b, i) => <MdBlock key={i} block={b} resolveImg={resolveImg} />)}
+      {blocks.map((b, i) => <MdBlock key={i} block={b} resolveImg={resolveImg} scale={scale} imgFill={imgFill} onLink={onLink} />)}
     </div>
   );
 }

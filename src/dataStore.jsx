@@ -49,6 +49,7 @@ import React from 'react';
 // finish loading — so the cycle resolves at runtime and never bites.
 import { useSettings } from './settings.jsx';
 import { buildAuditModel, serializeAuditFiles } from './auditExport.js';
+import { logActivity, setLogContext } from './activityLog.js';
 
 const MANIFEST_URL = '/data/index.json';
 const AUDIT_URL = '/api/audit';
@@ -701,8 +702,8 @@ export function DataProvider({ children }) {
         if (cancelled) return;
         const list = Array.isArray(json?.inputs) ? json.inputs : [];
         const normalised = list.map((it) => (typeof it === 'string'
-          ? { name: it, label: it }
-          : { name: it.name, label: it.label || it.name }));
+          ? { name: it, label: it, source: 'public/data' }
+          : { name: it.name, label: it.label || it.name, source: it.source || 'public/data' }));
         setInputs(normalised);
         if (normalised.length === 0) return;
         // Restore priority, narrowest match first:
@@ -722,6 +723,11 @@ export function DataProvider({ children }) {
         } else if (remembered && normalised.some((n) => n.name === remembered)) {
           setSelectedInput(remembered);
         } else {
+          // Genuine first open — no restorable position and no remembered trace.
+          // Land on the help/readme screen so a fresh auditor reads the mental
+          // model first; once any trace has loaded, last-input is set and later
+          // opens go straight to the trace.
+          if (!remembered) pendingNav.current = { screen: 'help', id: null, focus: null };
           setSelectedInput(normalised[normalised.length - 1].name);
         }
       })
@@ -854,6 +860,14 @@ export function DataProvider({ children }) {
     scheduleAuditSync();
   }, [scheduleAuditSync]);
 
+  // Keep the activity log stamped with the live trace + screen, so an action
+  // fired outside the store (a settings toggle, a copy click) records where the
+  // auditor was. The append-only activity log is a separate concern from the
+  // overlay mirror above — it records what was *done*, not the resulting state.
+  React.useEffect(() => {
+    setLogContext({ trace: selectedInput, screen });
+  }, [selectedInput, screen]);
+
   const visitChunk = React.useCallback((id) => {
     if (id == null || visitedRef.current[id]) return;
     const next = { ...visitedRef.current, [id]: true };
@@ -906,6 +920,13 @@ export function DataProvider({ children }) {
   const pushNav = React.useCallback((input, s, id, focus) => {
     if (input === inputRef.current && s === screenRef.current
       && id === currentIdRef.current && focus === focusRef.current) return;
+    // One chokepoint for every user-initiated navigation — tab/page switch,
+    // commit selection, deep-link, trace swap. The from/to tuples let a reader
+    // tell which axis changed (screen → tab, id → commit, input → trace).
+    logActivity('nav', {
+      from: { input: inputRef.current, screen: screenRef.current, id: currentIdRef.current, focus: focusRef.current },
+      to: { input, screen: s, id, focus },
+    });
     window.history.pushState({ input, screen: s, id, focus }, '');
   }, []);
 
@@ -1048,6 +1069,7 @@ export function DataProvider({ children }) {
     if (next[id]) delete next[id]; else next[id] = true;
     flaggedRef.current = next;
     setFlaggedOverlay(next);
+    logActivity('flag', { target: id, flagged: !!next[id] });
     persistOverlays();
   }, [persistOverlays]);
 
@@ -1063,6 +1085,7 @@ export function DataProvider({ children }) {
     if (next[key]) delete next[key]; else next[key] = true;
     dismissedRef.current = next;
     setDismissedOverlay(next);
+    logActivity('dismiss', { target: key, dismissed: !!next[key] });
     persistOverlays();
   }, [persistOverlays]);
 
@@ -1079,6 +1102,7 @@ export function DataProvider({ children }) {
     }
     dismissedRef.current = next;
     setDismissedOverlay(next);
+    logActivity('dismiss-batch', { count: keys.length, dismissed: !!dismissed });
     persistOverlays();
   }, [persistOverlays]);
 
@@ -1091,6 +1115,7 @@ export function DataProvider({ children }) {
     const next = { ...cur, [chunkId]: [...(cur[chunkId] || []), { id, text: t, createdAt: now, editedAt: now }] };
     notesRef.current = next;
     setUserNotesOverlay(next);
+    logActivity('note-add', { target: chunkId, note_id: id, text: t });
     persistOverlays();
   }, [persistOverlays]);
 
@@ -1101,6 +1126,7 @@ export function DataProvider({ children }) {
     const next = { ...cur, [chunkId]: list };
     notesRef.current = next;
     setUserNotesOverlay(next);
+    logActivity('note-edit', { target: chunkId, note_id: noteId, text: t });
     persistOverlays();
   }, [persistOverlays]);
 
@@ -1111,6 +1137,7 @@ export function DataProvider({ children }) {
     if (list.length) next[chunkId] = list; else delete next[chunkId];
     notesRef.current = next;
     setUserNotesOverlay(next);
+    logActivity('note-delete', { target: chunkId, note_id: noteId });
     persistOverlays();
   }, [persistOverlays]);
 
@@ -1132,6 +1159,7 @@ export function DataProvider({ children }) {
     const next = { ...groupsRef.current, [id]: { id, name: nm, color: color || null, createdAt: now } };
     groupsRef.current = next;
     setUserGroupsOverlay(next);
+    logActivity('group-create', { group_id: id, name: nm, color: color || null });
     persistOverlays();
     return id;
   }, [persistOverlays]);
@@ -1143,6 +1171,7 @@ export function DataProvider({ children }) {
     const next = { ...groupsRef.current, [id]: { ...cur, name: nm } };
     groupsRef.current = next;
     setUserGroupsOverlay(next);
+    logActivity('group-rename', { group_id: id, name: nm });
     persistOverlays();
   }, [persistOverlays]);
 
@@ -1169,6 +1198,7 @@ export function DataProvider({ children }) {
       const nn = { ...notesRef.current }; delete nn[ukey];
       notesRef.current = nn; setUserNotesOverlay(nn);
     }
+    logActivity('group-delete', { group_id: id });
     persistOverlays();
   }, [persistOverlays]);
 
@@ -1190,7 +1220,10 @@ export function DataProvider({ children }) {
       setGroupTagsOverlay(tagsRef.current);
       changed = true;
     }
-    if (changed) persistOverlays();
+    if (changed) {
+      logActivity('tag', { target: targetKey, group_id: groupId });
+      persistOverlays();
+    }
   }, [persistOverlays]);
 
   const untagTarget = React.useCallback((targetKey, groupId) => {
@@ -1201,6 +1234,7 @@ export function DataProvider({ children }) {
     if (kept.length) next[targetKey] = kept; else delete next[targetKey];
     tagsRef.current = next;
     setGroupTagsOverlay(next);
+    logActivity('untag', { target: targetKey, group_id: groupId });
     persistOverlays();
   }, [persistOverlays]);
 
@@ -1209,7 +1243,8 @@ export function DataProvider({ children }) {
   //     localStorage — not just the current trace, since "reset cache" reads as
   //     global, and other traces load their (now-cleared) markups on next select;
   //   * the live in-memory overlays for the current trace;
-  //   * the navigation position — back to the dossier with no commit selected.
+  //   * the navigation position — back to the help/readme screen with no commit
+  //     selected, so a reset mirrors a genuine fresh open (which lands on help).
   // The browser's back/forward *stack* can't be purged programmatically, so we
   // replaceState a fresh default tuple onto the current entry; older entries
   // remain reachable but restore into the now-empty markups.
@@ -1235,9 +1270,10 @@ export function DataProvider({ children }) {
     setUserGroupsOverlay({});
     setGroupTagsOverlay({});
     setCurrentId(null);
-    setScreen('dossier');
+    setScreen('help');
     setAreaFocus(null);
-    window.history.replaceState({ input: inputRef.current, screen: 'dossier', id: null, focus: null }, '');
+    window.history.replaceState({ input: inputRef.current, screen: 'help', id: null, focus: null }, '');
+    logActivity('reset-cache', {});
   }, []);
 
   const value = React.useMemo(() => {
@@ -1247,7 +1283,10 @@ export function DataProvider({ children }) {
     // key — chunks fold theirs into the derived chunk objects below instead.
     // userGroupsOverlay / groupTagsOverlay are the auditor's group registry and
     // membership map, read by the tag editor and the user-groups views.
-    const baseFields = { inputs, selectedInput, currentId, screen, areaFocus, userNotesOverlay, flaggedOverlay, dismissedOverlay, userGroupsOverlay, groupTagsOverlay, showAiSuspicion, ...actions };
+    // The selected trace's manifest entry ({ name, label, source }) — handoff
+    // prompts read it to name the trace + where its files live (see traceLocation).
+    const currentTrace = inputs.find((i) => i.name === selectedInput) || null;
+    const baseFields = { inputs, selectedInput, currentTrace, currentId, screen, areaFocus, userNotesOverlay, flaggedOverlay, dismissedOverlay, userGroupsOverlay, groupTagsOverlay, showAiSuspicion, ...actions };
     if (state.status !== 'ready') return { ...state, ...baseFields };
     const data = state.data;
     const chunks = data.chunks.map((c) => {

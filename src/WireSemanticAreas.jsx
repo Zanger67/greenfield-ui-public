@@ -24,8 +24,9 @@ import {
   Check,
   CopyBlock,
   CopyTitle,
-  CopyChip,
   refStatement,
+  UI_HANDOFF_PREFIX,
+  traceLocation,
   AppFrame,
   LoadingBox,
   PaneResizer,
@@ -33,7 +34,7 @@ import {
 } from './primitives.jsx';
 import { useData } from './dataStore.jsx';
 import { ScreenTabs } from './App.jsx';
-import { TopBarControls, Sha, TagFlagsHint, useSettings } from './settings.jsx';
+import { TopBarControls, Sha, TagFlagsHint, useSettings, useAnonymize } from './settings.jsx';
 import { ValidatorNotesEditor } from './ValidatorNotes.jsx';
 import { usergroupKey, TagEditor, useDescribeTarget, reverseTagIndex, pickGroupColor } from './Tagging.jsx';
 import { parseDiff, FileDiff, ColoredDiffBody, SuspicionDetail, DiffGroup, CommitHeader, LogDiffTable, BIG_FILE_LINES, PREVIEW_LINES } from './WireDossierInbox.jsx';
@@ -166,7 +167,11 @@ export function WireSemanticAreas() {
   return (
     <AppFrame
       topBar={<ScreenTabs />}
-      subtitle={`${userGroups.length} group${userGroups.length === 1 ? '' : 's'} · ${semanticAreas.length} flagged · ${threads.length} thread${threads.length === 1 ? '' : 's'}`}
+      subtitle={[
+        `${userGroups.length} group${userGroups.length === 1 ? '' : 's'}`,
+        showAiSuspicion && `${semanticAreas.length} AI flagged`,
+        `${threads.length} thread${threads.length === 1 ? '' : 's'}`,
+      ].filter(Boolean).join(' · ')}
       coverageProps={{ ...coverage, showSuspicion: showAiSuspicion }}
       rightSlot={<TopBarControls />}
     >
@@ -235,6 +240,7 @@ const themeColor = (t) => THEME_COLOR[t] || WF.ink2;
 // at the top"), then flagged areas (from suspicions), then semantic threads
 // (from the thread_agent).
 function Sidebar({ areas, threads, userGroups, sel, onSelect, width = 360, showAiSuspicion = true }) {
+  const anon = useAnonymize();
   const { data, flaggedOverlay = {}, dismissedOverlay = {} } = useData();
   const { bySha = {} } = data;
   // Each rail section collapses independently by clicking its head; the caret in
@@ -271,8 +277,8 @@ function Sidebar({ areas, threads, userGroups, sel, onSelect, width = 360, showA
             <div style={{ flex: 1 }} />
             <L mono size={10} color={WF.ink3}>{(a.commit_shas || []).length} commits</L>
           </div>
-          <L size={13} weight={600}>{a.title}</L>
-          <L mono size={10} color={WF.ink3}>{a.agent_id}{a.reviewed_by_opus ? ' · opus✓' : ''}</L>
+          <L size={13} weight={600}>{anon(a.title)}</L>
+          <L mono size={10} color={WF.ink3}>{anon(a.agent_id)}{a.reviewed_by_opus ? ' · opus✓' : ''}</L>
         </button>
         );
       })}
@@ -292,7 +298,7 @@ function Sidebar({ areas, threads, userGroups, sel, onSelect, width = 360, showA
             <div style={{ flex: 1 }} />
             <L mono size={10} color={WF.ink3}>{t.commit_shas.length} commits</L>
           </div>
-          <L size={13} weight={600}>{t.label}</L>
+          <L size={13} weight={600}>{anon(t.label)}</L>
         </button>
       ))}
     </div>
@@ -345,7 +351,7 @@ function UserGroupRail({ userGroups, sel, onSelect, collapsed = false, onToggle 
 }
 
 // Inline "create a group" row at the foot of the user-groups rail — type a name,
-// Enter (or ＋ add) to create it and select it for annotating.
+// Enter to create it and select it for annotating.
 function NewGroupRow({ onCreate }) {
   const [name, setName] = React.useState('');
   const submit = () => { const n = name.trim(); if (!n) return; onCreate(n); setName(''); };
@@ -358,7 +364,6 @@ function NewGroupRow({ onCreate }) {
         placeholder="new group name…"
         style={{ flex: 1, minWidth: 0, fontFamily: WF.monoFont, fontSize: 12, padding: '4px 6px', border: inkBorder(1.2), background: WF.paper, color: WF.ink }}
       />
-      <Chip onClick={submit} style={{ cursor: 'pointer', background: WF.paperAlt }}>＋ add</Chip>
     </div>
   );
 }
@@ -402,7 +407,8 @@ function RailHint({ text }) {
 }
 
 function AreaDetail({ area, onOpenCommit }) {
-  const { data, dismissedOverlay = {}, setDismissed } = useData();
+  const { data, dismissedOverlay = {}, setDismissed, currentTrace } = useData();
+  const anon = useAnonymize();
   const { bySha = {} } = data;
   const dismissed = isAreaDismissed(area, bySha, dismissedOverlay);
   // Cascade keys: every linked commit that *itself* carries an agent suspicion.
@@ -438,8 +444,8 @@ function AreaDetail({ area, onOpenCommit }) {
             {area.flag_level}
           </Chip>
           <Chip style={{ fontSize: 12 }}>{area.category}</Chip>
-          <Chip style={{ fontSize: 12 }}>intent: {area.intent_hypothesis}</Chip>
-          <L mono size={11} color={WF.ink3}>{area.agent_id}</L>
+          <Chip style={{ fontSize: 12 }}>intent: {anon(area.intent_hypothesis)}</Chip>
+          <L mono size={11} color={WF.ink3}>{anon(area.agent_id)}</L>
           {area.reviewed_by_opus && <Chip>opus reviewed</Chip>}
           {dismissed && <Chip bg={WF.paperAlt} color={WF.ink2}>dismissed</Chip>}
           <div style={{ flex: 1 }} />
@@ -454,8 +460,8 @@ function AreaDetail({ area, onOpenCommit }) {
         <CopyTitle
           size={18}
           style={{ marginTop: 8 }}
-          copyText={refStatement({ kind: 'area', label: area.title, idField: 'area_id', id: area.area_id, shas: area.commit_shas })}
-        >{area.title}</CopyTitle>
+          copyText={refStatement({ kind: 'area', label: area.title, targetKey: `area:${area.area_id}`, trace: currentTrace })}
+        >{anon(area.title)}</CopyTitle>
       </div>
 
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'flex-start' }}>
@@ -468,7 +474,7 @@ function AreaDetail({ area, onOpenCommit }) {
           size={10.5}
           italic
           style={{ flex: '1 1 240px', minWidth: 230 }}
-          text={`Investigate the flagged area "${area.title}" (area_id: ${area.area_id}). Read the UI's AGENTS.md for how to navigate the audit data and annotations.`}
+          text={`${UI_HANDOFF_PREFIX}${traceLocation(currentTrace)}Investigate the flagged area "${area.title}" — audit pointer area:${area.area_id}. Resolve it via the schema in the UI's AGENTS.md.`}
         />
       </div>
       <TextBlock label="reasoning" text={area.reasoning} accent={WF.heat4} />
@@ -489,6 +495,8 @@ function AreaDetail({ area, onOpenCommit }) {
 // commits, so it does not follow one file through them. This view is the
 // thread_agent's output only — no suspicion-agent flags are mixed in here.
 function ThreadDetail({ thread, onOpenCommit }) {
+  const { currentTrace } = useData();
+  const anon = useAnonymize();
   const accent = themeColor(thread.theme);
   return (
     <div style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 16, maxWidth: 1100 }}>
@@ -501,14 +509,14 @@ function ThreadDetail({ thread, onOpenCommit }) {
         <CopyTitle
           size={18}
           style={{ marginTop: 8 }}
-          copyText={refStatement({ kind: 'thread', label: thread.label, idField: 'thread_id', id: thread.thread_id, shas: thread.commit_shas })}
-        >{thread.label}</CopyTitle>
+          copyText={refStatement({ kind: 'thread', label: thread.label, targetKey: `thread:${thread.thread_id}`, trace: currentTrace })}
+        >{anon(thread.label)}</CopyTitle>
       </div>
 
       <CopyBlock
         size={10.5}
         italic
-        text={`Investigate the semantic thread "${thread.label}" (thread_id: ${thread.thread_id}). Read the UI's AGENTS.md for how to navigate the audit data and annotations.`}
+        text={`${UI_HANDOFF_PREFIX}${traceLocation(currentTrace)}Investigate the semantic thread "${thread.label}" — audit pointer thread:${thread.thread_id}. Resolve it via the schema in the UI's AGENTS.md.`}
       />
 
       <TextBlock label="direction" text={thread.direction} accent={accent} />
@@ -597,6 +605,7 @@ function ThreadProgression({ shas, beats = {}, accent = WF.heat3, onOpenCommit, 
 // collapses to its beat line.
 function ThreadCommit({ sha, parsed, index, total, note, accent = WF.heat3, onOpenCommit }) {
   const { data } = useData();
+  const anon = useAnonymize();
   const { bySha = {}, byId = {} } = data;
   const stub = bySha[sha];
   const chunk = stub ? (byId[stub.id] || stub) : null;
@@ -613,9 +622,9 @@ function ThreadCommit({ sha, parsed, index, total, note, accent = WF.heat3, onOp
         <Chip bg={WF.ink} color={WF.paper}>{stateLabel(index)}</Chip>
         <Sha sha={sha} size={13} weight={700} />
         {chunk && <Chip>{chunk.kind}</Chip>}
-        {chunk?.file && <L mono size={11} color={WF.ink2}>{chunk.file}</L>}
+        {chunk?.file && <L mono size={11} color={WF.ink2}>{anon(chunk.file)}</L>}
         <L size={12} color={WF.ink2} style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {chunk ? chunk.title : '(commit not in this trace’s event map)'}
+          {chunk ? anon(chunk.title) : '(commit not in this trace’s event map)'}
         </L>
         <L mono size={10} color={WF.ink3}>commit {index + 1} of {total}</L>
         {chunk && onOpenCommit && (
@@ -635,7 +644,7 @@ function ThreadCommit({ sha, parsed, index, total, note, accent = WF.heat3, onOp
       {open && (
         <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 18 }}>
           {parsed.other.length > 0 && (
-            <DiffGroup title={parsed.logs.length > 0 ? 'other files' : 'files'} accent={WF.ink} files={parsed.other} sha={sha} />
+            <DiffGroup accent={WF.ink} files={parsed.other} sha={sha} hideHeader />
           )}
           {parsed.commitMessage && <CommitHeader text={parsed.commitMessage} />}
           {parsed.logs.length > 0 && (
@@ -653,10 +662,11 @@ function ThreadCommit({ sha, parsed, index, total, note, accent = WF.heat3, onOp
 // the threading agent's voice, distinct from the diff below and from any
 // suspicion-agent flag (which this thread view deliberately does not surface).
 function ThreadBeat({ note, accent = WF.heat3 }) {
+  const anon = useAnonymize();
   return (
     <div style={{ padding: '10px 12px', borderLeft: `5px solid ${accent}`, background: WF.paper }}>
       <L size={10} weight={700} color={WF.ink3} style={{ display: 'block', marginBottom: 4, textTransform: 'uppercase', letterSpacing: 0.5 }}>🧵 thread note</L>
-      <L size={12.5} color={WF.ink2} style={{ display: 'block', lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{renderInline(note)}</L>
+      <L size={12.5} color={WF.ink2} style={{ display: 'block', lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{renderInline(anon(note))}</L>
     </div>
   );
 }
@@ -806,6 +816,7 @@ function collectGroupAgentComments(memberKeys, src) {
 // commit type (MODIFY / BASH / CREATE / …) and file. This puts the whole roster
 // in place under one header, so no separate "commits involved" section is needed.
 function UserGroupMemberRow({ memberKey, groupId, describe, src, onUntag, onOpenCommit }) {
+  const anon = useAnonymize();
   const d = describe(memberKey);
   if (!d) return null;
   const clickable = d.exists && d.open;
@@ -824,8 +835,8 @@ function UserGroupMemberRow({ memberKey, groupId, describe, src, onUntag, onOpen
       >
         <L mono size={12} color={WF.ink3} style={{ width: 14, textAlign: 'center' }}>{d.icon}</L>
         <Chip>{d.kind}</Chip>
-        <L size={13} weight={600} style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.label}</L>
-        <L mono size={10} color={WF.ink3}>{isContainer ? `${subCommits.length} commit${subCommits.length === 1 ? '' : 's'}` : d.sublabel}</L>
+        <L size={13} weight={600} style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{anon(d.label)}</L>
+        <L mono size={10} color={WF.ink3}>{isContainer ? `${subCommits.length} commit${subCommits.length === 1 ? '' : 's'}` : anon(d.sublabel)}</L>
         {clickable && <L mono size={11} color={WF.ink3}>→</L>}
         <Chip
           onClick={(e) => { e.stopPropagation(); onUntag(memberKey, groupId); }}
@@ -843,7 +854,7 @@ function UserGroupMemberRow({ memberKey, groupId, describe, src, onUntag, onOpen
               style={{ display: 'grid', gridTemplateColumns: 'auto 1fr auto', gap: 8, alignItems: 'baseline', padding: '2px 0', cursor: 'pointer' }}
             >
               <Chip style={{ background: WF.paperAlt, color: WF.ink2 }} title="commit type">{c.kindLabel || c.kind}</Chip>
-              <L mono size={11} color={WF.ink2} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.file || c.title}</L>
+              <L mono size={11} color={WF.ink2} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{anon(c.file || c.title)}</L>
               <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                 {c.userFlagged && <L mono size={10} color={WF.heat4} title="you flagged this commit">⚑</L>}
                 <Sha sha={c.sha} size={10} color={WF.ink3} />
@@ -865,7 +876,8 @@ function UserGroupMemberRow({ memberKey, groupId, describe, src, onUntag, onOpen
 // (under the `usergroup:` key); this view also surfaces it read-only alongside
 // the member notes.
 function UserGroupDetail({ group }) {
-  const { data, rawData, selectedInput, groupTagsOverlay = {}, userNotesOverlay = {}, renameUserGroup, deleteUserGroup, untagTarget, openCommit } = useData();
+  const { data, rawData, selectedInput, currentTrace, groupTagsOverlay = {}, userNotesOverlay = {}, renameUserGroup, deleteUserGroup, untagTarget, openCommit } = useData();
+  const anon = useAnonymize();
   const describe = useDescribeTarget();
   // Resolve against the ungated data so areas / annotations / threads are found
   // even when the AI-flags toggle has emptied them out of `data`.
@@ -924,6 +936,23 @@ function UserGroupDetail({ group }) {
     return [...byKey.values()].sort((a, b) => (a.index ?? 0) - (b.index ?? 0)).map((c) => c.sha);
   }, [memberKeys, src]);
 
+  // One-glance scope for the group handoff prompt: what kinds of items the auditor
+  // tagged (its "type" — a user group is heterogeneous), then the commit count its
+  // members transitively span. Pre-computes what AGENTS.md's "confirm scope first"
+  // step asks the agent to echo back. No first…last sha range: a user group's
+  // members aren't guaranteed to be consecutive commits (unlike a timeline/sidecar
+  // group), so a sha range would imply an adjacency that isn't there — the count
+  // alone is accurate. Same reasoning keeps the thread / area prompts range-free.
+  const groupScope = React.useMemo(() => {
+    const order = ['commit', 'group', 'area', 'thread', 'doc', 'plot'];
+    const noun = { commit: 'commit', group: 'sidecar group', area: 'area', thread: 'thread', doc: 'file', plot: 'plot' };
+    const counts = {};
+    for (const k of memberKeys) { const t = k.split(':')[0]; counts[t] = (counts[t] || 0) + 1; }
+    const parts = order.filter((t) => counts[t]).map((t) => `${counts[t]} ${noun[t]}${counts[t] === 1 ? '' : 's'}`);
+    const nC = compiledShas.length;
+    return `${parts.join(', ') || 'empty'} · spanning ${nC} commit${nC === 1 ? '' : 's'}`;
+  }, [memberKeys, compiledShas]);
+
   return (
     <div style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 16, maxWidth: 1100 }}>
       <div>
@@ -931,7 +960,6 @@ function UserGroupDetail({ group }) {
           <span style={{ width: 14, height: 14, background: group.color || WF.ink2, border: inkBorder() }} />
           <Chip bg={group.color || WF.ink2} color={WF.onAccent}>user group</Chip>
           <L mono size={11} color={WF.ink3}>{memberKeys.length} item{memberKeys.length === 1 ? '' : 's'}</L>
-          <CopyChip text={refStatement({ kind: 'user group', label: (name || '').trim() || group.name, idField: 'group_id', id: group.id, shas: compiledShas })} />
           <div style={{ flex: 1 }} />
           {armed ? (
             <>
@@ -958,7 +986,7 @@ function UserGroupDetail({ group }) {
           size={10.5}
           italic
           style={{ marginTop: 8 }}
-          text={`Investigate my audit tag group "${(name || '').trim() || group.name}". Read the UI's AGENTS.md for how to navigate the user tagging data and annotations.`}
+          text={`${UI_HANDOFF_PREFIX}${traceLocation(currentTrace)}Investigate my audit tag group "${(name || '').trim() || group.name}" — ${groupScope}. Resolve it via the schema in the UI's AGENTS.md.`}
         />
       </div>
 
@@ -1018,7 +1046,7 @@ function UserGroupDetail({ group }) {
                     onClick={c.open || undefined}
                     style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', ...(c.open ? { cursor: 'pointer', textDecoration: 'underline', textDecorationStyle: 'dotted', textUnderlineOffset: 2 } : {}) }}
                     title={c.open ? 'open this item' : undefined}
-                  >{c.label}</L>
+                  >{anon(c.label)}</L>
                 </div>
                 <L size={13} style={{ display: 'block', whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>{c.note.text}</L>
               </Box>
@@ -1037,6 +1065,7 @@ function UserGroupDetail({ group }) {
 // timeline. A plot renders its figure inline; a doc links into the results
 // screen. Folded by default so the diff timeline stays the focus.
 function GroupDocsPlots({ docPlotKeys, describe, selectedInput }) {
+  const anon = useAnonymize();
   const [open, setOpen] = React.useState(false);
   if (!docPlotKeys || docPlotKeys.length === 0) return null;
   return (
@@ -1070,13 +1099,13 @@ function GroupDocsPlots({ docPlotKeys, describe, selectedInput }) {
                 >
                   <L mono size={12} color={WF.ink3} style={{ width: 14, textAlign: 'center' }}>{d?.icon || '▤'}</L>
                   <Chip>{d?.kind || (isPlot ? 'plot' : 'doc')}</Chip>
-                  <L size={13} weight={600} style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d?.label || key}</L>
-                  {isPlot && <L mono size={10} color={WF.ink3}>{file}</L>}
+                  <L size={13} weight={600} style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{anon(d?.label || key)}</L>
+                  {isPlot && <L mono size={10} color={WF.ink3}>{anon(file)}</L>}
                   {d?.open && <L mono size={11} color={WF.ink3}>open →</L>}
                 </div>
                 {isPlot && url && (
                   <a href={url} target="_blank" rel="noreferrer" title="open full size">
-                    <img src={url} alt={d?.label || file} style={{ display: 'block', width: '100%', height: 'auto', border: inkBorder(1.2), background: WF.paper }} />
+                    <img src={url} alt={anon(d?.label || file)} style={{ display: 'block', width: '100%', height: 'auto', border: inkBorder(1.2), background: WF.paper }} />
                   </a>
                 )}
               </Box>
@@ -1141,6 +1170,7 @@ function AgentCommentsDropdown({ annotation, thread, onOpenCommit }) {
 // scope) above the model's text. Clicking the source opens that commit in the
 // dossier when the comment is commit-scoped.
 function AgentCommentCard({ c, accent = WF.ink2, onOpenCommit }) {
+  const anon = useAnonymize();
   const clickable = c.scope === 'commit' && c.id && onOpenCommit;
   return (
     <Box style={{ padding: 10, borderLeft: `4px solid ${accent}` }}>
@@ -1152,21 +1182,23 @@ function AgentCommentCard({ c, accent = WF.ink2, onOpenCommit }) {
         {c.scope === 'commit' && <Sha sha={c.sha} size={11} weight={700} />}
         {c.scope === 'group' && <Chip>group</Chip>}
         {c.scope === 'thread' && <Chip bg={WF.catBlue} color={WF.onAccent}>🧵 thread</Chip>}
-        {c.file && <L mono size={11} color={WF.ink2}>{c.file}</L>}
-        {(c.title || c.label) && <L size={12} color={WF.ink2} style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.title || c.label}</L>}
+        {c.file && <L mono size={11} color={WF.ink2}>{anon(c.file)}</L>}
+        {(c.title || c.label) && <L size={12} color={WF.ink2} style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{anon(c.title || c.label)}</L>}
         {clickable && <L mono size={11} color={WF.ink3}>open →</L>}
       </div>
-      <L size={13} color={WF.ink2} style={{ display: 'block', whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>{renderInline(c.text)}</L>
+      <L size={13} color={WF.ink2} style={{ display: 'block', whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>{renderInline(anon(c.text))}</L>
     </Box>
   );
 }
 
 function TextBlock({ label, text, accent = WF.ink }) {
+  const anon = useAnonymize();
   if (!text) return null;
+  // `label` is the static section name (chrome); only `text` is trace-derived.
   return (
     <Box style={{ padding: 12, borderLeft: `5px solid ${accent}` }}>
       <L size={11} weight={700} color={WF.ink3}>{label}</L>
-      <L size={13} style={{ display: 'block', marginTop: 4, whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>{renderInline(text)}</L>
+      <L size={13} style={{ display: 'block', marginTop: 4, whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>{renderInline(anon(text))}</L>
     </Box>
   );
 }
@@ -1176,6 +1208,7 @@ function TextBlock({ label, text, accent = WF.ink }) {
 // `beats` is supplied (threads), each commit's beat note is shown beneath it.
 function CommitStrip({ shas, onOpenCommit, beats, title = 'commits in this area' }) {
   const { data } = useData();
+  const anon = useAnonymize();
   const { bySha = {}, byId = {} } = data;
   return (
     <section>
@@ -1195,16 +1228,16 @@ function CommitStrip({ shas, onOpenCommit, beats, title = 'commits in this area'
                 <L mono size={10} color={WF.ink3} style={{ width: 18 }}>{stateLabel(i)}</L>
                 <Chip>{chunk ? chunk.kind : '?'}</Chip>
                 <Sha sha={sha} size={11} weight={700} />
-                {chunk?.file && <L mono size={11} color={WF.ink2}>{chunk.file}</L>}
+                {chunk?.file && <L mono size={11} color={WF.ink2}>{anon(chunk.file)}</L>}
                 <L size={12} color={WF.ink2} style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {chunk ? chunk.title : '(commit not in this trace’s event map)'}
+                  {chunk ? anon(chunk.title) : '(commit not in this trace’s event map)'}
                 </L>
                 {chunk && <Check on={chunk.visited} />}
                 {chunk && <L mono size={11} color={WF.ink3}>→</L>}
               </div>
               {note && (
                 <L size={12} color={WF.ink2} style={{ display: 'block', marginTop: 4, paddingLeft: 28, lineHeight: 1.4, whiteSpace: 'pre-wrap' }}>
-                  {renderInline(note)}
+                  {renderInline(anon(note))}
                 </L>
               )}
             </Box>
@@ -1332,6 +1365,7 @@ function FileProgression({ fp }) {
   // dossier inbox; commits in an area always come from the loaded trace, but a
   // missing entry just renders unclickable rather than failing.
   const { data, openCommit } = useData();
+  const anon = useAnonymize();
   const bySha = data?.bySha || {};
   const idForSha = (sha) => bySha[sha]?.id || null;
   const headerId = idForSha(fp.states[0]?.sha);
@@ -1343,7 +1377,7 @@ function FileProgression({ fp }) {
           title={headerId ? 'open the first commit in this file’s chain in the dossier inbox' : undefined}
           style={headerId ? { cursor: 'pointer', textDecoration: 'underline', textDecorationStyle: 'dotted', textUnderlineOffset: 2 } : undefined}
         >
-          <L mono size={13} weight={700}>{fp.path}</L>
+          <L mono size={13} weight={700}>{anon(fp.path)}</L>
         </span>
         {fp.isLog && <Chip>log file</Chip>}
         <div style={{ flex: 1 }} />
@@ -1390,6 +1424,7 @@ function FileProgression({ fp }) {
 // reuse the dossier's SuspicionDetail so the wording matches the inbox.
 function MemberSuspicionsSummary({ shas }) {
   const { data, openCommit } = useData();
+  const anon = useAnonymize();
   const { bySha = {}, byId = {} } = data;
   const groups = [];
   for (let i = 0; i < (shas || []).length; i += 1) {
@@ -1420,9 +1455,9 @@ function MemberSuspicionsSummary({ shas }) {
             >
               <L mono size={10} color={WF.ink3} style={{ width: 18 }}>{stateLabel(index)}</L>
               <Sha sha={sha} size={11} weight={700} />
-              {chunk?.file && <L mono size={11} color={WF.ink2}>{chunk.file}</L>}
+              {chunk?.file && <L mono size={11} color={WF.ink2}>{anon(chunk.file)}</L>}
               <L size={12} color={WF.ink2} style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {chunk ? chunk.title : '(commit not in this trace’s event map)'}
+                {chunk ? anon(chunk.title) : '(commit not in this trace’s event map)'}
               </L>
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -1476,6 +1511,7 @@ const LOG_ROW_MAX_ROWS = 12;
 const LOG_ROW_MAX_HEIGHT = Math.round(LOG_ROW_MAX_ROWS * 11 * 1.45) + 16;
 
 function LogFileRow({ file, first, border }) {
+  const anon = useAnonymize();
   const [full, setFull] = React.useState(false);
   const adds = file.body.filter((l) => /^\+[^+]/.test(l)).length;
   const dels = file.body.filter((l) => /^-[^-]/.test(l)).length;
@@ -1491,7 +1527,7 @@ function LogFileRow({ file, first, border }) {
     <tr>
       <td style={{ ...cell, borderRight: border, background: WF.paper, padding: '8px 10px' }}>
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'baseline' }}>
-          <L mono size={11} weight={700} style={{ wordBreak: 'break-all' }}>{file.path}</L>
+          <L mono size={11} weight={700} style={{ wordBreak: 'break-all' }}>{anon(file.path)}</L>
           {adds > 0 && <L mono size={11} color={WF.add}>+{adds}</L>}
           {dels > 0 && <L mono size={11} color={WF.heat4}>−{dels}</L>}
           {file.isBinary && <Chip>binary</Chip>}

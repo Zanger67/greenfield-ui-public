@@ -14,7 +14,7 @@ import {
 } from './primitives.jsx';
 import { useData } from './dataStore.jsx';
 import { ScreenTabs } from './App.jsx';
-import { TopBarControls, Sha } from './settings.jsx';
+import { TopBarControls, Sha, useAnonymize } from './settings.jsx';
 import { usergroupKey, reverseTagIndex, useDescribeTarget, GroupTagChips } from './Tagging.jsx';
 import { collectGroupMarkups, collectSemanticMarkups, collectDocMarkups, collectPlotMarkups } from './auditExport.js';
 
@@ -113,7 +113,10 @@ export function WireOverview() {
 
   const exportBlob = () => {
     // The export is the auditor's deliverable, so it carries ONLY user-authored
-    // items — the auditor's own flags and notes. The AI suspicion layer (narrator
+    // items — the auditor's own flags and notes. This download keeps its own
+    // camelCase shape for a human; the canonical on-disk store the local agent
+    // reads is built by buildAuditModel + serializeAuditFiles in auditExport.js.
+    // The AI suspicion layer (narrator
     // flag levels, deterministic pre-flags, suspicion coverage) is deliberately
     // left out, whatever the AI-flags view toggle is set to. Read from the ungated
     // data so user markups on suspicion-derived areas still export when the toggle
@@ -236,7 +239,7 @@ export function WireOverview() {
   return (
     <AppFrame
       topBar={<ScreenTabs />}
-      subtitle={`auditor output · ${chunks.length} commits · ${flagged.length} flagged`}
+      subtitle="auditor output"
       coverageProps={{ ...coverage, showSuspicion: showAiSuspicion }}
       rightSlot={<TopBarControls />}
     >
@@ -323,6 +326,7 @@ function suspicionRank(level) {
 // This is the overview's mirror of the semantic-areas "user groups" category —
 // the grouping the auditor built propagates here as part of the output view.
 function UserGroupsSection({ groups, memberIndex, describe, flaggedOverlay, userNotesOverlay, onOpenGroup }) {
+  const anon = useAnonymize();
   return (
     <section>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
@@ -363,8 +367,8 @@ function UserGroupsSection({ groups, memberIndex, describe, flaggedOverlay, user
                         key={key}
                         onClick={d.exists && d.open ? (e) => { e.stopPropagation(); d.open(); } : undefined}
                         style={{ cursor: d.exists && d.open ? 'pointer' : 'default', opacity: d.exists ? 1 : 0.6, maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis' }}
-                        title={`${d.kind} · ${d.sublabel}`}
-                      >{d.icon} {d.label}</Chip>
+                        title={`${d.kind} · ${anon(d.sublabel)}`}
+                      >{d.icon} {anon(d.label)}</Chip>
                     );
                   })}
                 </div>
@@ -455,6 +459,7 @@ function OverviewSection({ title, accent, chunks, empty, onOpen, onDismiss, show
 
 function OverviewRow({ chunk, onOpen, onDismiss, showNotes, showSuspicions, accent, dimmed }) {
   const { groupTagsOverlay = {} } = useData();
+  const anon = useAnonymize();
   // A dismissed suspicion row reads as "cleared": the warning heat is desaturated
   // (heat4 → heat2) and the whole card softened, so it stays legible but plainly
   // demoted below the live suspicion queue.
@@ -479,7 +484,7 @@ function OverviewRow({ chunk, onOpen, onDismiss, showNotes, showSuspicions, acce
         {chunk._isDoc && <Chip bg={WF.ink} color={WF.paper} title="this entry is a result document on the final-results screen">📄 document</Chip>}
         {chunk._isPlot && <Chip bg={WF.ink} color={WF.paper} title="this entry is a result plot on the final-results screen">🖼 plot</Chip>}
         <Sha sha={chunk.sha} size={12} color={WF.ink3} />
-        {chunk.file && <L mono size={11} color={WF.ink2}>{chunk.file}</L>}
+        {chunk.file && <L mono size={11} color={WF.ink2}>{anon(chunk.file)}</L>}
         {chunk.flag && <Chip bg={WF.paperAlt} color={WF.ink2} title="heuristic note (not a verdict): a results file was produced then later deleted — common in normal iteration, and can also be a logging-process artifact">ⓘ note · {chunk.flag.kind}</Chip>}
         {chunk.userFlagged && !chunk.flag && <Chip bg={WF.userflag} color={WF.onAccent}>{chunk._isGroup ? 'group flagged' : chunk._isArea ? 'area flagged' : chunk._isThread ? 'thread flagged' : chunk._isDoc ? 'document flagged' : chunk._isPlot ? 'plot flagged' : 'user flagged'}</Chip>}
         {dimmed && <Chip bg={WF.paperAlt} color={WF.ink2}>dismissed</Chip>}
@@ -493,8 +498,8 @@ function OverviewRow({ chunk, onOpen, onDismiss, showNotes, showSuspicions, acce
         )}
         <Check on={chunk.visited} />
       </div>
-      <L size={13} weight={600} style={{ display: 'block', marginTop: 6 }}>{chunk.title}</L>
-      <L size={12} color={WF.ink2} style={{ display: 'block', marginTop: 2 }}>{chunk.summary}</L>
+      <L size={13} weight={600} style={{ display: 'block', marginTop: 6 }}>{anon(chunk.title)}</L>
+      <L size={12} color={WF.ink2} style={{ display: 'block', marginTop: 2 }}>{anon(chunk.summary)}</L>
       {/* The user groups this item was tagged into — clicking a chip jumps to
           that group on the semantic-areas screen. */}
       {tagged && (
@@ -512,9 +517,9 @@ function OverviewRow({ chunk, onOpen, onDismiss, showNotes, showSuspicions, acce
               <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
                 <Chip bg={susAccent} color={WF.onAccent}>{s.flag_level}</Chip>
                 <Chip>{s.category}</Chip>
-                <L mono size={10} color={WF.ink3}>{s.agent_id}</L>
+                <L mono size={10} color={WF.ink3}>{anon(s.agent_id)}</L>
               </div>
-              <L size={12} style={{ display: 'block', marginTop: 4, whiteSpace: 'pre-wrap' }}>{s.commit_commentary}</L>
+              <L size={12} style={{ display: 'block', marginTop: 4, whiteSpace: 'pre-wrap' }}>{anon(s.commit_commentary)}</L>
             </div>
           ))}
         </div>

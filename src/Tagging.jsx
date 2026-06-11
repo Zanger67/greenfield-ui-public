@@ -177,7 +177,7 @@ const inputStyle = {
 // panels it lives in. Tagging a target into a group it isn't already in adds it;
 // creating makes the group (cycling the palette) and tags in one step.
 export function TagEditor({ targetKey, placeholder = 'tag into a group…' }) {
-  const { userGroupsOverlay = {}, groupTagsOverlay = {}, createUserGroup, tagTarget, untagTarget } = useData();
+  const { userGroupsOverlay = {}, groupTagsOverlay = {}, createUserGroup, tagTarget, untagTarget, openUserGroup } = useData();
   const wrapRef = React.useRef(null);
   const [query, setQuery] = React.useState('');
   const [open, setOpen] = React.useState(false);
@@ -261,7 +261,13 @@ export function TagEditor({ targetKey, placeholder = 'tag into a group…' }) {
       {currentGroups.length > 0 && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
           {currentGroups.map((g) => (
-            <GroupBadge key={g.id} group={g} onRemove={() => untagTarget(targetKey, g.id)} title={`in group: ${g.name}`} />
+            <GroupBadge
+              key={g.id}
+              group={g}
+              onClick={openUserGroup ? () => openUserGroup(g.id) : undefined}
+              onRemove={() => untagTarget(targetKey, g.id)}
+              title={`in group: ${g.name}${openUserGroup ? ' — open' : ''}`}
+            />
           ))}
         </div>
       )}
