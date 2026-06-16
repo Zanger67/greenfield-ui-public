@@ -44,6 +44,13 @@ import { parseDiff, FileDiff, ColoredDiffBody, SuspicionDetail, DiffGroup, Commi
 const areaKey = (id) => `area:${id}`;
 const threadKey = (id) => `thread:${id}`;
 
+// Synthetic "unnamed group" id. It's not a registry record — it gathers every
+// flagged item the auditor hasn't tagged into a named group yet, so those items
+// stay visible (and assignable) in the user-groups section rather than being
+// stranded with no home. An item leaves the bucket the moment it's tagged into
+// any group (it then shows only there) or its flag is cleared.
+const UNASSIGNED_GROUP_ID = '__unassigned__';
+
 // A suspicion-area is the auditor's view of one suspicion, and that same
 // suspicion is dismissed in the dossier inbox / overview by its *anchor commit's*
 // chunk id (event_id) — never this `area:` key. So an area's dismissed state is
@@ -80,12 +87,32 @@ function parseFocus(token) {
 }
 
 export function WireSemanticAreas() {
-  const { data, showAiSuspicion, openCommit, areaFocus, recordFocus, dismissedOverlay = {}, userGroupsOverlay = {} } = useData();
+  const { data, showAiSuspicion, openCommit, areaFocus, recordFocus, dismissedOverlay = {}, userGroupsOverlay = {}, flaggedOverlay = {}, groupTagsOverlay = {} } = useData();
   // The auditor's own user groups lead the screen (the rail's top category).
   // Ordered by creation so the list is stable as groups are added.
   const userGroups = React.useMemo(
     () => Object.values(userGroupsOverlay).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)),
     [userGroupsOverlay],
+  );
+  // Flagged items the auditor hasn't tagged into any named group yet still belong
+  // in the user-groups section — gathered under one synthetic "unnamed group" so
+  // they stay visible and can be assigned. A `usergroup:` key (a group's own flag)
+  // isn't a taggable item; anything already in >=1 group shows only under those
+  // groups, never here.
+  const unassignedFlagged = React.useMemo(
+    () => Object.keys(flaggedOverlay).filter(
+      (k) => flaggedOverlay[k] && !k.startsWith('usergroup:') && (groupTagsOverlay[k] || []).length === 0,
+    ),
+    [flaggedOverlay, groupTagsOverlay],
+  );
+  // The synthetic group is appended only when it has members. Real groups keep
+  // their own count (the subtitle), but rail rendering / selection / existence
+  // checks run over `railGroups` so the unnamed bucket is selectable like any.
+  const railGroups = React.useMemo(
+    () => (unassignedFlagged.length
+      ? [...userGroups, { id: UNASSIGNED_GROUP_ID, name: '', color: WF.ink3, synthetic: true, members: unassignedFlagged }]
+      : userGroups),
+    [userGroups, unassignedFlagged],
   );
   // When the top-bar AI-flags pill is off (default), the data store has already
   // emptied `semanticAreas` — areas are derived entirely from the narrator's
@@ -134,14 +161,14 @@ export function WireSemanticAreas() {
     const exists = sel && (
       (sel.kind === 'area' && semanticAreas.some((a) => a.area_id === sel.id)) ||
       (sel.kind === 'thread' && threads.some((t) => t.thread_id === sel.id)) ||
-      (sel.kind === 'usergroup' && userGroups.some((g) => g.id === sel.id))
+      (sel.kind === 'usergroup' && railGroups.some((g) => g.id === sel.id))
     );
     if (exists) return;
     if (semanticAreas.length) setSel({ kind: 'area', id: semanticAreas[0].area_id });
     else if (threads.length) setSel({ kind: 'thread', id: threads[0].thread_id });
-    else if (userGroups.length) setSel({ kind: 'usergroup', id: userGroups[0].id });
+    else if (railGroups.length) setSel({ kind: 'usergroup', id: railGroups[0].id });
     else setSel(null);
-  }, [semanticAreas, threads, userGroups, sel]);
+  }, [semanticAreas, threads, railGroups, sel]);
 
   // Entry focus: another screen (e.g. a commit's thread link, or an overview
   // user-group row) deep-linked us to a specific item via the "kind:id" token.
@@ -154,21 +181,25 @@ export function WireSemanticAreas() {
     if (!next) return;
     if (next.kind === 'thread' && !threads.some((t) => t.thread_id === next.id)) return;
     if (next.kind === 'area' && !semanticAreas.some((a) => a.area_id === next.id)) return;
-    if (next.kind === 'usergroup' && !userGroups.some((g) => g.id === next.id)) return;
+    if (next.kind === 'usergroup' && !railGroups.some((g) => g.id === next.id)) return;
     lastFocus.current = areaFocus;
     setSel(next);
-  }, [areaFocus, threads, semanticAreas, userGroups]);
+  }, [areaFocus, threads, semanticAreas, railGroups]);
 
   const area = sel?.kind === 'area' ? semanticAreas.find((a) => a.area_id === sel.id) : null;
   const thread = sel?.kind === 'thread' ? threads.find((t) => t.thread_id === sel.id) : null;
-  const userGroup = sel?.kind === 'usergroup' ? userGroups.find((g) => g.id === sel.id) : null;
-  const hasDetail = !!(area || thread || userGroup);
+  const userGroup = sel?.kind === 'usergroup' ? railGroups.find((g) => g.id === sel.id) : null;
+  // The right-hand auditor panel renders for areas, threads, and real user
+  // groups — but not the synthetic "unnamed group" (it has no own annotation
+  // key), so its resizer is gated on the same condition to avoid a dangling grip.
+  const hasAuditorPanel = !!(area || thread || (userGroup && !userGroup.synthetic));
 
   return (
     <AppFrame
       topBar={<ScreenTabs />}
       subtitle={[
         `${userGroups.length} group${userGroups.length === 1 ? '' : 's'}`,
+        unassignedFlagged.length > 0 && `${unassignedFlagged.length} ungrouped`,
         showAiSuspicion && `${semanticAreas.length} AI flagged`,
         `${threads.length} thread${threads.length === 1 ? '' : 's'}`,
       ].filter(Boolean).join(' · ')}
@@ -176,7 +207,7 @@ export function WireSemanticAreas() {
       rightSlot={<TopBarControls />}
     >
       <div style={{ flex: 1, minHeight: 0, display: 'flex', overflow: 'hidden' }}>
-        <Sidebar areas={semanticAreas} threads={threads} userGroups={userGroups} sel={sel} onSelect={selectItem} width={paneWidths.areasSidebar} showAiSuspicion={showAiSuspicion} />
+        <Sidebar areas={semanticAreas} threads={threads} userGroups={railGroups} sel={sel} onSelect={selectItem} width={paneWidths.areasSidebar} showAiSuspicion={showAiSuspicion} />
         <PaneResizer
           width={paneWidths.areasSidebar}
           setWidth={(w) => setPaneWidth('areasSidebar', w)}
@@ -188,10 +219,10 @@ export function WireSemanticAreas() {
         <div style={{ flex: 1, minWidth: 0, overflow: 'auto' }}>
           {area ? <AreaDetail area={area} onOpenCommit={openCommit} />
             : thread ? <ThreadDetail thread={thread} onOpenCommit={openCommit} />
-            : userGroup ? <UserGroupDetail group={userGroup} />
+            : userGroup ? (userGroup.synthetic ? <UnassignedGroupDetail group={userGroup} /> : <UserGroupDetail group={userGroup} />)
             : <Empty showAiSuspicion={showAiSuspicion} />}
         </div>
-        {hasDetail && (
+        {hasAuditorPanel && (
           <PaneResizer
             width={paneWidths.auditorPanel}
             setWidth={(w) => setPaneWidth('auditorPanel', w)}
@@ -207,7 +238,7 @@ export function WireSemanticAreas() {
             tagging is disabled here (a group can't be tagged into a group) and so
             is the flag (showFlag={false}) — a group is built *from* flagged items,
             so a flag on the group itself would be redundant. */}
-        {userGroup && <AuditorPanel targetKey={usergroupKey(userGroup.id)} noun="group" width={paneWidths.auditorPanel} showTags={false} showFlag={false} />}
+        {userGroup && !userGroup.synthetic && <AuditorPanel targetKey={usergroupKey(userGroup.id)} noun="group" width={paneWidths.auditorPanel} showTags={false} showFlag={false} />}
       </div>
     </AppFrame>
   );
@@ -320,9 +351,14 @@ function UserGroupRail({ userGroups, sel, onSelect, collapsed = false, onToggle 
         <RailHint text="no groups yet — flag an item and tag it into a group, or add one below" />
       )}
       {!collapsed && userGroups.map((g) => {
-        const members = memberIndex[g.id] || [];
-        const notes = userNotesOverlay[usergroupKey(g.id)] || [];
-        const flagged = !!flaggedOverlay[usergroupKey(g.id)];
+        // The synthetic "unnamed group" carries its members on the object (the
+        // flagged-but-ungrouped keys) and has no name / own flag / annotations;
+        // it renders muted, with a dashed swatch and an "unassigned" chip, so it
+        // reads as a triage bucket rather than a group the auditor named.
+        const synthetic = !!g.synthetic;
+        const members = synthetic ? (g.members || []) : (memberIndex[g.id] || []);
+        const notes = synthetic ? [] : (userNotesOverlay[usergroupKey(g.id)] || []);
+        const flagged = !synthetic && !!flaggedOverlay[usergroupKey(g.id)];
         const active = sel?.kind === 'usergroup' && sel.id === g.id;
         return (
           <button
@@ -331,14 +367,16 @@ function UserGroupRail({ userGroups, sel, onSelect, collapsed = false, onToggle 
             style={railBtn(g.color || WF.ink2, active)}
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-              <span style={{ width: 10, height: 10, background: g.color || WF.ink2, border: `1px solid ${WF.ink}` }} />
-              <Chip>group</Chip>
+              <span style={{ width: 10, height: 10, background: synthetic ? 'transparent' : (g.color || WF.ink2), border: `1px ${synthetic ? 'dashed' : 'solid'} ${synthetic ? WF.ink3 : WF.ink}` }} />
+              <Chip bg={synthetic ? WF.paperAlt : undefined} color={synthetic ? WF.ink2 : undefined}>{synthetic ? 'unassigned' : 'group'}</Chip>
               {flagged && <RailFlag />}
               <div style={{ flex: 1 }} />
               <L mono size={10} color={WF.ink3}>{members.length} item{members.length === 1 ? '' : 's'}</L>
             </div>
-            <L size={13} weight={600}>{g.name}</L>
-            {notes.length > 0 && <L mono size={10} color={WF.ink3}>{notes.length} annotation{notes.length === 1 ? '' : 's'}</L>}
+            <L size={13} weight={600} color={synthetic ? WF.ink3 : undefined} style={synthetic ? { fontStyle: 'italic' } : undefined}>{synthetic ? 'unnamed group' : g.name}</L>
+            {synthetic
+              ? <L mono size={10} color={WF.ink3}>flagged · not yet grouped</L>
+              : (notes.length > 0 && <L mono size={10} color={WF.ink3}>{notes.length} annotation{notes.length === 1 ? '' : 's'}</L>)}
           </button>
         );
       })}
@@ -865,6 +903,92 @@ function UserGroupMemberRow({ memberKey, groupId, describe, src, onUntag, onOpen
         </div>
       )}
     </Box>
+  );
+}
+
+// One flagged-but-ungrouped item, shown in the unnamed-group bucket. Same header
+// row a grouped member uses (icon · kind · label · open →), but where a real
+// member offers "untag ×", this offers the two ways out of the bucket: assign it
+// to a group (the tag editor) or clear the flag. Either drops it from the bucket
+// on the next render — tagging because it's now grouped, unflagging because it's
+// no longer flagged.
+function UnassignedMemberRow({ memberKey, describe, src }) {
+  const anon = useAnonymize();
+  const { toggleFlag } = useData();
+  const d = describe(memberKey);
+  if (!d) return null;
+  const clickable = d.exists && d.open;
+  const colon = memberKey.indexOf(':');
+  const prefix = colon > 0 ? memberKey.slice(0, colon) : '';
+  const isContainer = prefix === 'group' || prefix === 'area' || prefix === 'thread';
+  const subCommits = (isContainer ? commitsForMemberKey(memberKey, src) : []).map((c) => src.byId?.[c.id] || c);
+  return (
+    <Box style={{ padding: 0, opacity: d.exists ? 1 : 0.6 }}>
+      <div
+        onClick={clickable ? d.open : undefined}
+        style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 10px', cursor: clickable ? 'pointer' : 'default' }}
+      >
+        <L mono size={12} color={WF.ink3} style={{ width: 14, textAlign: 'center' }}>{d.icon}</L>
+        <Chip>{d.kind}</Chip>
+        <L size={13} weight={600} style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{anon(d.label)}</L>
+        <L mono size={10} color={WF.ink3}>{isContainer ? `${subCommits.length} commit${subCommits.length === 1 ? '' : 's'}` : anon(d.sublabel)}</L>
+        {clickable && <L mono size={11} color={WF.ink3}>→</L>}
+        <Chip
+          onClick={(e) => { e.stopPropagation(); toggleFlag(memberKey); }}
+          style={{ cursor: 'pointer', background: WF.paper }}
+          title="clear your flag on this item — removes it from the unnamed group"
+        >unflag</Chip>
+      </div>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ borderTop: `1px solid ${WF.rule}`, padding: '8px 10px' }}
+      >
+        <L size={10} weight={700} color={WF.ink3} style={{ display: 'block', marginBottom: 6 }}>assign to a group</L>
+        <TagEditor targetKey={memberKey} placeholder="tag into a group…" />
+      </div>
+    </Box>
+  );
+}
+
+// Detail pane for the synthetic "unnamed group": the flagged items not yet tagged
+// into any named group. It's a triage bucket, not a group record — nothing to
+// rename / delete / annotate, and no own AuditorPanel. Each row carries the tag
+// editor so the auditor can file the item into a real group from here; doing so
+// (or clearing the flag) removes it from the bucket. Members come from the rail's
+// precomputed list on the group object.
+function UnassignedGroupDetail({ group }) {
+  const { data, rawData } = useData();
+  const describe = useDescribeTarget();
+  const src = rawData || data || {};
+  const memberKeys = group.members || [];
+  return (
+    <div style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 16, maxWidth: 1100 }}>
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <span style={{ width: 14, height: 14, background: 'transparent', border: `1px dashed ${WF.ink3}` }} />
+          <Chip bg={WF.paperAlt} color={WF.ink2}>unnamed group</Chip>
+          <L mono size={11} color={WF.ink3}>{memberKeys.length} item{memberKeys.length === 1 ? '' : 's'}</L>
+        </div>
+        <L size={18} weight={700} color={WF.ink3} style={{ display: 'block', marginTop: 10, fontStyle: 'italic' }}>flagged, not yet grouped</L>
+        <L mono size={11} color={WF.ink3} style={{ display: 'block', marginTop: 6 }}>
+          Items you flagged but haven’t tagged into a group. Assign one to a group to file it, or clear its flag to drop it — either way it leaves this bucket.
+        </L>
+      </div>
+
+      <section>
+        <SectionHead title="members" count={memberKeys.length} hint="assign to a group, or clear the flag" accent={WF.ink3} />
+        {memberKeys.length === 0 && (
+          <L mono size={11} color={WF.ink3} style={{ display: 'block', paddingLeft: 2 }}>
+            nothing flagged is currently ungrouped.
+          </L>
+        )}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {memberKeys.map((key) => (
+            <UnassignedMemberRow key={key} memberKey={key} describe={describe} src={src} />
+          ))}
+        </div>
+      </section>
+    </div>
   );
 }
 

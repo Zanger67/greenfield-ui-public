@@ -9,29 +9,30 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Git context is served per-trace. A trace dropped into public/data/<name>/
 // mirrors the raw output layout (the whole `output/<trace>/` folder copied in
-// verbatim), so its reconstruction repo lives at public/data/<name>/codebase.
-// Every /api/* endpoint carries the selected input `name`; resolveRepo() maps
-// it to that codebase. An input that ships without its own codebase/ has no
-// repo to serve from, and the git endpoints report that rather than serving a
-// shared fallback.
+// verbatim), so its reconstruction repo lives at
+// public/data/<name>/reconstructed_codebase (or, for traces built before that
+// rename, public/data/<name>/codebase). Every /api/* endpoint carries the
+// selected input `name`; resolveRepo() maps it to that repo. An input that ships
+// without its own reconstruction repo has none to serve from, and the git
+// endpoints report that rather than serving a shared fallback.
 const PUBLIC_DATA = path.resolve(__dirname, 'public', 'data');
 
 // Self-hosting fallback. When this repo is cloned *inside* a trace's output
 // folder (e.g. as `<trace>/ui/`), the trace's own directories sit one level up
-// at ../ — ../codebase, ../commit_builder_metadata, ../main_results, the
-// experiment markdown, etc. With nothing dropped into public/data, the UI runs
-// directly on that surrounding trace instead of a vendored copy. See
-// parentTraceInput(): the marker is the pair every commit-builder output
-// carries (codebase/ + commit_builder_metadata/), and the input takes the
-// parent folder's own name — mirroring how public/data inputs are named for
-// their dir.
+// at ../ — ../reconstructed_codebase (or legacy ../codebase),
+// ../commit_builder_metadata, ../main_results, the experiment markdown, etc.
+// With nothing dropped into public/data, the UI runs directly on that
+// surrounding trace instead of a vendored copy. See parentTraceInput(): the
+// marker is the pair every commit-builder output carries (its inner repo +
+// commit_builder_metadata/), and the input takes the parent folder's own name —
+// mirroring how public/data inputs are named for their dir.
 const REPO_PARENT = path.resolve(__dirname, '..');
 
 // Auditor-produced annotations are mirrored from the running UI to disk *inside
 // the trace's own directory*, under <traceDir>/audit/, so a local coding agent
 // reads them right next to the trace it audits (see POST /api/audit below). The
 // trace dir is resolved from the input name exactly as the git endpoints resolve
-// the codebase (see resolveTraceDir): a dropped trace at public/data/<name>/, or
+// its reconstruction repo (see resolveTraceDir): a dropped trace at public/data/<name>/, or
 // — when this repo is self-hosted inside a trace — the surrounding trace at ../.
 // Either way the audit/ dir is gitignored or outside the repo, i.e. mutable
 // working output. The allowlist is the fixed set of relative paths the UI may
@@ -72,12 +73,28 @@ const SHA_RE = /^[0-9a-f]{7,40}$/;
 // traversal — keep it to the characters trace dir names actually use.
 const NAME_RE = /^[A-Za-z0-9._-]+$/;
 
+// The inner reconstruction git repo a commit-builder output carries. New traces
+// name it `reconstructed_codebase/`; traces built before that rename used
+// `codebase/`. Accept either, preferring the canonical name. The git endpoints
+// detect the actual repo by its `.git`.
+const INNER_REPO_DIRS = ['reconstructed_codebase', 'codebase'];
+
+// Resolve the inner git repo directly under `base` (a trace dir): the first of
+// INNER_REPO_DIRS that exists with a `.git`, or null when neither is present.
+function repoDirIn(base) {
+  for (const d of INNER_REPO_DIRS) {
+    const repo = path.join(base, d);
+    if (fs.existsSync(path.join(repo, '.git'))) return repo;
+  }
+  return null;
+}
+
 // The surrounding trace, when this repo was cloned inside one (see REPO_PARENT).
-// Detected by the same pair every commit-builder output carries — codebase/ +
-// commit_builder_metadata/ both present at ../ — and named for the parent
-// folder. Returns { name, dir } or null. Cheap stat()s, called per request; the
-// filesystem is the source of truth so a folder appearing/disappearing is seen
-// without a restart.
+// Detected by the marker pair every commit-builder output carries — its inner
+// repo (reconstructed_codebase/, or legacy codebase/) + commit_builder_metadata/
+// both present at ../ — and named for the parent folder. Returns { name, dir } or
+// null. Cheap stat()s, called per request; the filesystem is the source of truth
+// so a folder appearing/disappearing is seen without a restart.
 function parentTraceInput() {
   const name = path.basename(REPO_PARENT);
   if (!NAME_RE.test(name)) return null;
@@ -85,25 +102,27 @@ function parentTraceInput() {
     try { return fs.statSync(path.join(REPO_PARENT, d)).isDirectory(); }
     catch { return false; }
   };
-  if (hasDir('codebase') && hasDir('commit_builder_metadata')) {
+  const hasInnerRepo = INNER_REPO_DIRS.some((d) => hasDir(d));
+  if (hasInnerRepo && hasDir('commit_builder_metadata')) {
     return { name, dir: REPO_PARENT };
   }
   return null;
 }
 
-// Map an input name to its reconstruction repo: the dropped trace's own
-// codebase/, detected by its `.git`. Returns null when the input carries no
-// codebase of its own — the git endpoints then report a clean error instead of
-// serving some other trace's repo. Falls back to the self-hosting parent
-// trace's ../codebase when the name is that parent (see parentTraceInput).
+// Map an input name to its reconstruction repo: the dropped trace's own inner
+// repo (reconstructed_codebase/, or legacy codebase/), detected by its `.git`.
+// Returns null when the input carries no repo of its own — the git endpoints then
+// report a clean error instead of serving some other trace's repo. Falls back to
+// the self-hosting parent trace's repo when the name is that parent (see
+// parentTraceInput).
 function resolveRepo(name) {
   if (name && NAME_RE.test(name)) {
-    const candidate = path.join(PUBLIC_DATA, name, 'codebase');
-    if (fs.existsSync(path.join(candidate, '.git'))) return candidate;
+    const dropped = repoDirIn(path.join(PUBLIC_DATA, name));
+    if (dropped) return dropped;
     const parent = parentTraceInput();
     if (parent && parent.name === name) {
-      const repo = path.join(parent.dir, 'codebase');
-      if (fs.existsSync(path.join(repo, '.git'))) return repo;
+      const repo = repoDirIn(parent.dir);
+      if (repo) return repo;
     }
   }
   return null;
@@ -125,13 +144,16 @@ function resolveTraceDir(name) {
   return null;
 }
 
-// A trace's display name (its dropdown label): metadata.json's "ui_name",
-// trimmed, when set; otherwise the caller falls back to the directory name.
-// Display-only — the input's `name` stays the directory name, which keys every
-// /data and /api path and every localStorage overlay. Read live (file is tiny).
+// A trace's display name (its dropdown label): the commit builder's
+// "ui_name", trimmed, when set; otherwise the caller falls back to the
+// directory name. It lives in the commit-builder sidecar
+// (commit_builder_metadata/metadata.json), not the trace's own verbatim
+// metadata.json. Display-only — the input's `name` stays the directory name,
+// which keys every /data and /api path and every localStorage overlay. Read
+// live (file is tiny).
 function readUiName(dir) {
   try {
-    const meta = JSON.parse(fs.readFileSync(path.join(dir, 'metadata.json'), 'utf8'));
+    const meta = JSON.parse(fs.readFileSync(path.join(dir, 'commit_builder_metadata', 'metadata.json'), 'utf8'));
     const ui = meta && typeof meta.ui_name === 'string' ? meta.ui_name.trim() : '';
     return ui || null;
   } catch {
@@ -179,7 +201,7 @@ function discoverInputs() {
 
 function runGit(repo, args) {
   return new Promise((resolve) => {
-    if (!repo) return resolve({ code: -1, stdout: '', stderr: 'no codebase for this input' });
+    if (!repo) return resolve({ code: -1, stdout: '', stderr: 'no reconstruction repo for this input' });
     const git = spawn('git', ['-C', repo, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
@@ -192,7 +214,7 @@ function runGit(repo, args) {
 
 function runGitBinary(repo, args) {
   return new Promise((resolve) => {
-    if (!repo) return resolve({ code: -1, body: Buffer.alloc(0), stderr: 'no codebase for this input' });
+    if (!repo) return resolve({ code: -1, body: Buffer.alloc(0), stderr: 'no reconstruction repo for this input' });
     const git = spawn('git', ['-C', repo, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
     const chunks = [];
     let stderr = '';
@@ -717,9 +739,14 @@ export default defineConfig({
   server: {
     port: 5173,
     open: false,
-    // Dropped traces carry their own git repo (and codebases) under
-    // public/data/<name>/. Don't let the dev server watch those — the .git
-    // dirs and source trees are large and immutable for our purposes.
-    watch: { ignored: ['**/public/data/**/codebase/**', '**/public/data/**/final_codebase/**'] },
+    // Dropped traces carry their own reconstruction git repo (reconstructed_codebase/,
+    // or legacy codebase/) plus final_codebase/ under public/data/<name>/. Don't let
+    // the dev server watch those — the .git dirs and source trees are large and
+    // immutable for our purposes.
+    watch: { ignored: [
+      '**/public/data/**/reconstructed_codebase/**',
+      '**/public/data/**/codebase/**',
+      '**/public/data/**/final_codebase/**',
+    ] },
   },
 });

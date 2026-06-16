@@ -5,13 +5,13 @@ UI repo found at [github.com/Zanger67/greenfield-ui-public](https://github.com/Z
 A blue-team UI for auditing a research project. An upstream pipeline
 (separate repo) turns the agent's trace into a **git repo with one commit per
 event** — every bash call, file creation, and file edit is its own commit, all
-living in `codebase/`. A set of JSONL sidecar files carrying AI-Blue Team annotations, 
+living in `reconstructed_codebase/`. A set of JSONL sidecar files carrying AI-Blue Team annotations, 
 deterministic anomaly flags, and an LLM suspicion pass lives in `commit_builder_metadata/`, 
 rendered by the UI. This app lets you step through those commits, flag them, take notes, 
 group them, and handoff to local agents via the schema described in the `AGENTS.MD`.
 
 **No backend.** `npm run dev` runs a small Vite server with middleware that shells
-out to `git` against each trace's `codebase/` to power the diff / blob / file-log /
+out to `git` against each trace's `reconstructed_codebase/` to power the diff / blob / file-log /
 checkout views. There is no server, no auth, no database — the whole thing is a
 single-URL static artifact you can hand to an external auditor.
 
@@ -30,7 +30,7 @@ itself dropped in as `ui/`.
 
 ```text
 <trace>/                       one processed trace — one self-contained folder from the pipeline
-├── codebase/                  reconstructed git repo — one commit per agent event (real .git)
+├── reconstructed_codebase/    reconstructed git repo — one commit per agent event (real .git)
 ├── final_codebase/            the end state the agent delivered (snapshot, no .git)
 ├── logs/                      raw red-team logger output the repo was rebuilt from —
 │                              audit.jsonl/.log, commands.jsonl/.log, diffs/, terminal_logs/
@@ -49,10 +49,12 @@ itself dropped in as `ui/`.
 
 ### Important directories
 
-- **`codebase/`** is a real, walkable git repo — one commit per agent event — and
-  it's what every diff / blob / file-log / checkout view shells out against.
-  **`final_codebase/`** is just the delivered end state as a flat snapshot (no
-  `.git`), for diffing against where the agent actually landed.
+- **`reconstructed_codebase/`** is a real, walkable git repo — one commit per agent
+  event — and it's what every diff / blob / file-log / checkout view shells out
+  against. (Traces built before this dir was renamed use **`codebase/`**; the UI
+  reads either, preferring `reconstructed_codebase/`.) **`final_codebase/`** is just
+  the delivered end state as a flat snapshot (no `.git`), for diffing against where
+  the agent actually landed.
 - **`logs/`** is the untouched red-team logger output the repo was reconstructed
   from; **`commit_builder_metadata/`** is the processed layer on top — the JSONL
   sidecars (event spine, annotations, flags, threads, suspicions) the UI actually
@@ -87,7 +89,7 @@ A handful of design choices shape everything else in the UI:
 
 - **One commit per agent event.** Each row in the timeline is a single edit, bash
   call, or tool invocation, reconstructed as a real git commit. The whole
-  `codebase/` is a working git repo.
+  `reconstructed_codebase/` is a working git repo.
 
 - **Order is chronological, not serial.** Commits are sorted by *when* each action
   happened — but that does **not** mean the agent did one thing at a time. The
@@ -103,12 +105,12 @@ A handful of design choices shape everything else in the UI:
 
 
 > [!TIP]
-> `public/data/<trace>/codebase/` is a **full git repo**. You may optionally open it directly in your
+> `public/data/<trace>/reconstructed_codebase/` is a **full git repo**. You may optionally open it directly in your
 > IDE. Clicking the *checkout* button will checkout the active commit locally. Or point a local AI agent at
 > it and ask it to run `git log`, `git diff`, `git show <sha>`, `git log -p <path>`
 > — often the fastest way to follow a file through the trace. We recommend referencing the [AGENTS.md](AGENTS.md) schema for agent navigation.
 
-![Opening a trace's codebase/ git repo directly in an IDE](docs/readme%20instructions/ide_git_codebase_demo.gif)
+![Opening a trace's reconstructed_codebase/ git repo directly in an IDE](docs/readme%20instructions/ide_git_codebase_demo.gif)
 
 > [!TIP]
 > Everything you mark — flags, named groups, annotations, notes, coverage — is saved
@@ -133,8 +135,13 @@ Present on every screen:
 - **?** — opens this help page.
 - **🌙 / 🔆** — dark / light toggle.
 - **⚙** — display & session settings popover (see the [settings table](#settings-reference)).
+- **xx:xx** — Timer for ease of tracking stage in BTing
 
 ![The top bar — input selector, screen tabs, coverage, AI flags toggle, help, theme, and settings](docs/readme%20instructions/top_bar_configs.png)
+
+![Timer](docs/readme%20instructions/timer.png)
+
+
 
 ---
 
@@ -239,7 +246,7 @@ Drop it into a Claude Code (or any local agent) context and it resolves against 
   its commits.
 - **A named group** — clicking one of your groups copies a reference to the whole
   bundle, with its compiled change history and annotations.
-- **The whole repo** — point the agent straight at `codebase/` and let it run
+- **The whole repo** — point the agent straight at `reconstructed_codebase/` and let it run
   `git log` / `git diff` / `git show` itself (see the IDE tip above).
 
 ![A code agent resolving the pasted reference via the AGENTS.md schema](docs/readme%20instructions/auto_prompt_demo_1.gif)
@@ -267,7 +274,7 @@ filters on file-name substring. A reset button clears all conditions.
 ### Check out a commit in your editor
 
 Sends `POST /api/checkout`, which runs `git checkout <sha>` in the
-trace's `codebase/`.
+trace's `reconstructed_codebase/`.
 
 ![Checking a commit out in your editor and stepping through the git graph](docs/readme%20instructions/git_checkout_demo.gif)
 
@@ -320,7 +327,7 @@ drop them in locally; don't commit them.
 
 ```
 public/data/<trace>/
-├── codebase/                       full git repo, one commit per agent event
+├── reconstructed_codebase/         full git repo, one commit per agent event
 │   ├── .git/                       ← open this in an IDE to follow checkouts
 │   ├── src/, experiments/, …       working tree at the latest commit
 │   └── pyproject.toml, uv.lock
@@ -366,5 +373,6 @@ there's no index to hand-edit. Two sources appear together in the dropdown as pe
    `metadata.json`. Drop the upstream `output/<trace>/` folder in as
    `public/data/<name>/` and reload — it appears.
 2. **The surrounding trace** — if this repo is cloned *inside* a trace's output
-   folder (so the trace's `codebase/` + `commit_builder_metadata/` sit at `../`),
-   that parent is auto-detected and offered as one more option.
+   folder (so the trace's `reconstructed_codebase/` — or legacy `codebase/` — +
+   `commit_builder_metadata/` sit at `../`), that parent is auto-detected and
+   offered as one more option.

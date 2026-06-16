@@ -31,7 +31,8 @@
 // Two on-disk layouts are supported per input:
 //   * Dropped trace — the whole `output/<trace>/` folder copied verbatim
 //     into public/data/<name>/, so the commit-builder artifacts live under
-//     `commit_builder_metadata/` and the git repo under `codebase/`.
+//     `commit_builder_metadata/` and the git repo under `reconstructed_codebase/`
+//     (or, for traces built before that rename, `codebase/`).
 //   * Flat — every jsonl sits directly at public/data/<name>/ (the original
 //     hand-assembled layout).
 // Each artifact is fetched from its nested location first, then the flat

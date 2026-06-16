@@ -12,6 +12,7 @@ import React from 'react';
 import { WF, L, inkBorder, scrambleText } from './primitives.jsx';
 import { useData } from './dataStore.jsx';
 import { logActivity } from './activityLog.js';
+import { SessionTimer } from './SessionTimer.jsx';
 
 const SETTINGS_KEY = 'redlogs:settings';
 // `inboxSubline` chooses what the greyed secondary line under each inbox row
@@ -497,12 +498,13 @@ export function HelpButton() {
   );
 }
 
-// Groups the controls mounted in each screen's AppFrame `rightSlot`: the AI-flags
-// pill (the most consequential control, so it leads), then the help / theme /
-// settings icons as a matched trio.
+// Groups the controls mounted in each screen's AppFrame `rightSlot`: the session
+// timer (glanceable audit-budget readout, leads), the AI-flags pill (the most
+// consequential toggle), then the help / theme / settings icons as a matched trio.
 export function TopBarControls() {
   return (
     <div style={{ display: 'inline-flex', alignItems: 'center', gap: 12 }}>
+      <SessionTimer />
       <AiFlagsToggle />
       <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
         <HelpButton />

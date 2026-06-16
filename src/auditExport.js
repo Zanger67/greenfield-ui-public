@@ -503,7 +503,7 @@ export function renderAuditMarkdown(model, exportedAt) {
   L.push(`# Audit notes — ${model.trace || 'trace'}`);
   L.push('');
   L.push('> Auditor-authored hints, mirrored from the audit UI. Not ground truth —');
-  L.push('> confirm against the logs and the diffs in `codebase/`.');
+  L.push('> confirm against the logs and the diffs in `reconstructed_codebase/`.');
   L.push('');
   L.push(`- Coverage: ${model.coverage.visited}/${model.coverage.total} commits visited`);
   L.push(`- Flagged: ${model.session.flag_count}`);

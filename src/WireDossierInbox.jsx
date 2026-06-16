@@ -1442,7 +1442,7 @@ function useRefCopy(copyText) {
 // Right-pane dossier for a selected group: identity header, a clickable member
 // list, and the cumulative patch the whole group produced.
 function GroupDossier({ group, onSelectCommit }) {
-  const { data, flaggedOverlay = {}, userNotesOverlay = {}, toggleFlag, currentTrace } = useData();
+  const { data, flaggedOverlay = {}, userNotesOverlay = {}, toggleFlag, currentTrace, showAiSuspicion } = useData();
   const anon = useAnonymize();
   const meta = groupMeta(group.kind);
   const bigChip = { fontSize: 16, padding: '6px 12px', borderRadius: 3 };
@@ -1464,12 +1464,16 @@ function GroupDossier({ group, onSelectCommit }) {
   // the agent expands the pointer for members + notes. Its title, describing line,
   // and group-kind / file-class badges all copy this same handoff, each with its own
   // flash so only the line you clicked confirms "copied ✓".
+  // Only the timeline (dossier) screen opts into the sidecar, and only when the
+  // AI-flags layer is on. GroupDossier renders solely on this screen, so
+  // `showAiSuspicion` alone satisfies "on timeline AND AI flags on".
   const copyText = refStatement({
     kind: 'commit group',
     label: group.root || '(group)',
     targetKey: `group:${group.id}`,
     detail: `${titleLabel} · ${n} commit${n === 1 ? '' : 's'} ${group.fromSha.slice(0, 7)}…${group.toSha.slice(0, 7)}`,
     trace: currentTrace,
+    sidecarData: showAiSuspicion,
   });
   const { rowProps, renderFlash } = useRefCopy(copyText);
 
@@ -1899,7 +1903,7 @@ function FileEditStep({ member, file, index, total, onSelectCommit }) {
 }
 
 function DossierBody({ chunk, byId, checkedOut, pendingCheckout, checkoutEnabled, onCheckout, onNavigate }) {
-  const { toggleDismiss, toggleFlag, currentTrace } = useData();
+  const { toggleDismiss, toggleFlag, currentTrace, showAiSuspicion } = useData();
   const { showAuditEventBox } = useSettings();
   const anon = useAnonymize();
   const style = KIND_STYLE[chunk.kind] || KIND_STYLE.SYNC;
@@ -1921,7 +1925,7 @@ function DossierBody({ chunk, byId, checkedOut, pendingCheckout, checkoutEnabled
   // its `inner_commit_sha` so the agent can `git show` straight away. The title,
   // describing subline, source label, and kind badge all copy this same handoff,
   // each with its own flash so only the line you clicked confirms "copied ✓".
-  const copyText = refStatement({ kind: 'commit', label: chunk.title || chunk.file || '(untitled)', targetKey: `commit:${chunk.id}`, sha: chunk.sha || null, single: true, trace: currentTrace });
+  const copyText = refStatement({ kind: 'commit', label: chunk.title || chunk.file || '(untitled)', targetKey: `commit:${chunk.id}`, sha: chunk.sha || null, single: true, trace: currentTrace, sidecarData: showAiSuspicion });
   const { rowProps, renderFlash } = useRefCopy(copyText);
 
   return (

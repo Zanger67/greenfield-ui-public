@@ -394,13 +394,17 @@ export function traceLocation(trace) {
 // `expand(anchor)` procedure, which jsonl files to read, the jq queries) lives in
 // AGENTS.md, deliberately kept out of this prompt so it stays short. A single commit
 // also carries its `inner_commit_sha` inline.
-export function refStatement({ kind, label, targetKey, sha = null, single = false, detail = null, trace = null }) {
+export function refStatement({ kind, label, targetKey, sha = null, single = false, detail = null, trace = null, sidecarData = false }) {
   const ptr = targetKey ? ` — audit pointer ${targetKey}` : '';
   const git = single && sha ? ` · inner_commit_sha ${sha}` : '';
   // For a group handoff, `detail` carries its scope at a glance — type, commit
   // count, first…last sha — so the agent can confirm it resolved the right thing.
   const det = detail ? ` · ${detail}` : '';
-  return `${UI_HANDOFF_PREFIX}${traceLocation(trace)}${kind} "${label}"${ptr}${git}${det}. Resolve it via the schema in the UI's AGENTS.md.`;
+  // `sidecarData` opts the agent into the gated sidecar (commit_builder_metadata/)
+  // by emitting the literal token AGENTS.md keys off. Only the timeline screen sets
+  // it, and only when the AI-flags layer is on; otherwise the sidecar stays off.
+  const sidecar = sidecarData ? ' The AI suspicion layer is in scope — sidecar-data:include.' : '';
+  return `${UI_HANDOFF_PREFIX}${traceLocation(trace)}${kind} "${label}"${ptr}${git}${det}. Resolve it via the schema in the UI's AGENTS.md.${sidecar}`;
 }
 
 // A monospace, copy-to-clipboard block: clicking the text OR the corner button
