@@ -161,6 +161,33 @@ function readUiName(dir) {
   }
 }
 
+// Files a trace ships under supplemental_materials/ — auxiliary docs (PDFs,
+// images, markdown, …) the results screen lists and opens. Unlike the fixed plot
+// set (probed client-side by known filename), these names are open-ended, so the
+// listing is synthesized here and rides along in /data/index.json — which means
+// it works the same in the dev server and in a static build. Returns file paths
+// relative to supplemental_materials/, recursive, sorted; [] when absent. Dot-
+// files and nested dirs named like a path traversal are skipped.
+function listSupplemental(traceDir) {
+  if (!traceDir) return [];
+  const root = path.join(traceDir, 'supplemental_materials');
+  const out = [];
+  const walk = (dir, prefix) => {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch { return; }
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue;
+      const rel = prefix ? `${prefix}/${e.name}` : e.name;
+      if (e.isDirectory()) walk(path.join(dir, e.name), rel);
+      else if (e.isFile()) out.push(rel);
+    }
+  };
+  walk(root, '');
+  out.sort((a, b) => a.localeCompare(b));
+  return out;
+}
+
 // Trace discovery. The selectable inputs are the subdirectories of public/data
 // that hold a trace (marked by a metadata.json), PLUS — when this repo sits
 // inside a trace's output folder — the surrounding parent trace (see
@@ -184,7 +211,12 @@ function discoverInputs() {
   const inputs = entries
     .filter((e) => e.isDirectory() && NAME_RE.test(e.name)
       && fs.existsSync(path.join(PUBLIC_DATA, e.name, 'metadata.json')))
-    .map((e) => ({ name: e.name, label: readUiName(path.join(PUBLIC_DATA, e.name)) || e.name, source: 'public/data' }));
+    .map((e) => ({
+      name: e.name,
+      label: readUiName(path.join(PUBLIC_DATA, e.name)) || e.name,
+      source: 'public/data',
+      supplemental: listSupplemental(path.join(PUBLIC_DATA, e.name)),
+    }));
   // The surrounding trace joins the public/data traces as a peer. Skip it only
   // when a dropped trace already claims the same name (public/data owns path
   // resolution for a name collision; see resolveRepo). `source` tells the client
@@ -192,11 +224,29 @@ function discoverInputs() {
   // so handoff prompts can name that location for the coding agent (see traceLocation).
   const parent = parentTraceInput();
   if (parent && !inputs.some((i) => i.name === parent.name)) {
-    inputs.push({ name: parent.name, label: readUiName(parent.dir) || parent.name, source: 'parent' });
+    inputs.push({
+      name: parent.name,
+      label: readUiName(parent.dir) || parent.name,
+      source: 'parent',
+      supplemental: listSupplemental(parent.dir),
+    });
   }
   inputs.sort((a, b) =>
     a.label.toLowerCase().localeCompare(b.label.toLowerCase()) || a.name.localeCompare(b.name));
   return inputs;
+}
+
+// Parse the optional `paths` query param (newline-joined, URL-decoded by the
+// URL parser) into a validated pathspec list for `git … -- <paths>`. Returns
+// [] when absent, or null on a malformed entry (too long / NUL / a leading dash
+// that git would read as a flag) so the caller can 400.
+function parseDiffPaths(raw) {
+  if (!raw) return [];
+  const paths = raw.split('\n').map((p) => p.trim()).filter(Boolean);
+  for (const p of paths) {
+    if (p.length > 1024 || p.includes('\0') || p.startsWith('-')) return null;
+  }
+  return paths;
 }
 
 function runGit(repo, args) {
@@ -249,6 +299,11 @@ const STATIC_TYPES = {
   '.jsonl': 'application/x-ndjson; charset=utf-8',
   '.md':    'text/markdown; charset=utf-8',
   '.txt':   'text/plain; charset=utf-8',
+  '.csv':   'text/plain; charset=utf-8',
+  '.log':   'text/plain; charset=utf-8',
+  // Served inline (not octet-stream) so the results screen's PDF reader can embed
+  // a supplemental .pdf via <object>/<iframe> instead of triggering a download.
+  '.pdf':   'application/pdf',
 };
 function staticContentType(p) {
   const i = p.lastIndexOf('.');
@@ -561,21 +616,21 @@ function checkoutMiddleware() {
         res.end(stderr || `git exit ${code}`);
       });
 
-      // GET /api/diff?sha=<sha>&name=<input> → text of `git show <sha>`
-      // (commit header + patch).
+      // GET /api/diff?sha=<sha>&name=<input>[&paths=<a\nb>] → text of
+      // `git show <sha>` (commit header + patch). With `paths` (newline-joined,
+      // URL-encoded) the patch is restricted to those files — used to batch-fetch
+      // just the small files' bodies after a /api/diffstat pass, so the heavy
+      // ones are never sent until the auditor opens them.
       server.middlewares.use('/api/diff', async (req, res) => {
         const url = new URL(req.url, 'http://x');
         const sha = url.searchParams.get('sha') || '';
         const repo = resolveRepo(url.searchParams.get('name'));
         if (!SHA_RE.test(sha)) { res.statusCode = 400; return res.end('bad sha'); }
-        const { code, stdout, stderr } = await runGit(repo, [
-          'show',
-          '--no-color',
-          '--format=fuller',
-          '--stat',
-          '--patch',
-          sha,
-        ]);
+        const paths = parseDiffPaths(url.searchParams.get('paths'));
+        if (paths === null) { res.statusCode = 400; return res.end('bad paths'); }
+        const args = ['show', '--no-color', '--format=fuller', '--stat', '--patch', sha];
+        if (paths.length) args.push('--', ...paths);
+        const { code, stdout, stderr } = await runGit(repo, args);
         if (code === 0) {
           res.setHeader('content-type', 'text/plain; charset=utf-8');
           res.end(stdout);
@@ -599,7 +654,13 @@ function checkoutMiddleware() {
         const repo = resolveRepo(url.searchParams.get('name'));
         res.setHeader('content-type', 'text/plain; charset=utf-8');
         if (!SHA_RE.test(from) || !SHA_RE.test(to)) { res.statusCode = 400; return res.end('bad sha'); }
-        const diffArgs = (base) => ['diff', '--no-color', '--stat', '--patch', base, to];
+        const paths = parseDiffPaths(url.searchParams.get('paths'));
+        if (paths === null) { res.statusCode = 400; return res.end('bad paths'); }
+        const diffArgs = (base) => {
+          const a = ['diff', '--no-color', '--stat', '--patch', base, to];
+          if (paths.length) a.push('--', ...paths);
+          return a;
+        };
         let { code, stdout, stderr } = await runGit(repo, diffArgs(`${from}~1`));
         if (code !== 0) {
           // `from` has no parent (root commit) — diff against the empty tree.
@@ -612,6 +673,45 @@ function checkoutMiddleware() {
           res.statusCode = 500;
           res.end(stderr || `git exit ${code}`);
         }
+      });
+
+      // GET /api/diffstat?sha=<sha>&name=<input> → `git show --numstat --summary`:
+      // one line per file (`<added>\t<deleted>\t<path>`, `-` for binary) plus a
+      // create/delete/rename summary, and NO patch bodies. The cheap first pass
+      // that lets the client list every file with its diff size and decide which
+      // to render inline vs. leave collapsed (click-to-load).
+      server.middlewares.use('/api/diffstat', async (req, res) => {
+        const url = new URL(req.url, 'http://x');
+        const sha = url.searchParams.get('sha') || '';
+        const repo = resolveRepo(url.searchParams.get('name'));
+        res.setHeader('content-type', 'text/plain; charset=utf-8');
+        if (!SHA_RE.test(sha)) { res.statusCode = 400; return res.end('bad sha'); }
+        const { code, stdout, stderr } = await runGit(repo, [
+          'show', '--no-color', '--format=fuller', '--numstat', '--summary', sha,
+        ]);
+        if (code === 0) { res.end(stdout); }
+        else { res.statusCode = 500; res.end(stderr || `git exit ${code}`); }
+      });
+
+      // GET /api/groupdiffstat?from=<sha>&to=<sha>&name=<input> → the group's
+      // cumulative `git diff --numstat --summary <from>~1 <to>` (same empty-tree
+      // root fallback as /api/groupdiff). Stat-only counterpart used to size a
+      // group's net change before loading any file body.
+      server.middlewares.use('/api/groupdiffstat', async (req, res) => {
+        const url = new URL(req.url, 'http://x');
+        const from = url.searchParams.get('from') || '';
+        const to = url.searchParams.get('to') || '';
+        const repo = resolveRepo(url.searchParams.get('name'));
+        res.setHeader('content-type', 'text/plain; charset=utf-8');
+        if (!SHA_RE.test(from) || !SHA_RE.test(to)) { res.statusCode = 400; return res.end('bad sha'); }
+        const diffArgs = (base) => ['diff', '--no-color', '--numstat', '--summary', base, to];
+        let { code, stdout, stderr } = await runGit(repo, diffArgs(`${from}~1`));
+        if (code !== 0) {
+          const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+          ({ code, stdout, stderr } = await runGit(repo, diffArgs(EMPTY_TREE)));
+        }
+        if (code === 0) { res.end(stdout); }
+        else { res.statusCode = 500; res.end(stderr || `git exit ${code}`); }
       });
 
       // GET /api/filediff?base=<rev>&target=<sha>&path=<path>&context=<n>&name=<input>

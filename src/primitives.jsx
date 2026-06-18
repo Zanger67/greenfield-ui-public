@@ -719,12 +719,29 @@ export function AppFrame({ topBar, subtitle, children, coverage = true, coverage
         ...style,
       }}
     >
-      <div style={{ borderBottom: inkBorder(), padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
-        {topBar}
-        {subtitle && <L size={12} color={WF.ink3} mono>{subtitle}</L>}
+      {/* nowrap keeps the right-side cluster (coverage + timer / AI-flags
+          controls) on the same line as the tabs; when a long subtitle (e.g. the
+          threads & groups counts) would otherwise force a wrap, the subtitle is
+          the element that yields — it shrinks and ellipsizes, and the flex
+          spacer collapses, so the visited indicator sits just after the counts
+          instead of the controls dropping to a second row. */}
+      <div style={{ borderBottom: inkBorder(), padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'nowrap' }}>
+        {/* The tabs block keeps its natural width (and its own one-line layout) —
+            only the subtitle yields under nowrap, so the tabs never get squeezed
+            into a second row below REDLOGS / the dropdown. */}
+        <div style={{ flexShrink: 0 }}>{topBar}</div>
+        {subtitle && (
+          <L
+            size={12}
+            color={WF.ink3}
+            mono
+            title={typeof subtitle === 'string' ? subtitle : undefined}
+            style={{ display: 'block', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+          >{subtitle}</L>
+        )}
         <div style={{ flex: 1 }} />
-        {coverage && <Coverage {...(coverageProps || {})} />}
-        {rightSlot}
+        {coverage && <div style={{ flexShrink: 0 }}><Coverage {...(coverageProps || {})} /></div>}
+        {rightSlot && <div style={{ flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 12 }}>{rightSlot}</div>}
       </div>
       <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         {children}

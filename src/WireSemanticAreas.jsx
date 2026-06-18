@@ -37,7 +37,7 @@ import { ScreenTabs } from './App.jsx';
 import { TopBarControls, Sha, TagFlagsHint, useSettings, useAnonymize } from './settings.jsx';
 import { ValidatorNotesEditor } from './ValidatorNotes.jsx';
 import { usergroupKey, TagEditor, useDescribeTarget, reverseTagIndex, pickGroupColor } from './Tagging.jsx';
-import { parseDiff, FileDiff, ColoredDiffBody, SuspicionDetail, DiffGroup, CommitHeader, LogDiffTable, BIG_FILE_LINES, PREVIEW_LINES } from './WireDossierInbox.jsx';
+import { loadLazyCommitDiff, FileDiff, ColoredDiffBody, SuspicionDetail, DiffGroup, CommitHeader, LogDiffTable, BIG_FILE_LINES, PREVIEW_LINES } from './WireDossierInbox.jsx';
 
 // Markup overlays on areas/threads are keyed in the shared notes/flags maps
 // under a namespaced id so they never collide with a chunk's event id.
@@ -152,6 +152,44 @@ export function WireSemanticAreas() {
     lastFocus.current = token;
     recordFocus(token);
   }, [recordFocus]);
+
+  // Flat top-to-bottom order of the rail, used by keyboard navigation so ↑/↓ walk
+  // the visible left column the same way the dossier's arrows walk its commit
+  // list. Order mirrors the Sidebar render: user groups, then flagged areas (only
+  // when AI flags are on, matching the rail's own conditional), then threads.
+  const railItems = React.useMemo(() => [
+    ...railGroups.map((g) => ({ kind: 'usergroup', id: g.id })),
+    ...(showAiSuspicion ? semanticAreas.map((a) => ({ kind: 'area', id: a.area_id })) : []),
+    ...threads.map((t) => ({ kind: 'thread', id: t.thread_id })),
+  ], [railGroups, semanticAreas, threads, showAiSuspicion]);
+
+  // Keyboard transport for the rail, mirroring the dossier (whose left column *is*
+  // the commit list): ↑ / ↓ step the selection up / down the column. We claim the
+  // key in the capture phase and stop propagation so the data store's global arrow
+  // handler — which walks chunks chronologically and is meaningless on this
+  // idea-grouped screen — doesn't also fire. Skipped in text fields / with a
+  // modifier held; ←/→ fall through to the global handler untouched.
+  React.useEffect(() => {
+    const onKey = (e) => {
+      if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+      const t = e.target;
+      const tag = t && t.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return;
+      let dir = 0;
+      if (e.key === 'ArrowUp') dir = -1;
+      else if (e.key === 'ArrowDown') dir = 1;
+      else return;
+      if (railItems.length === 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const idx = sel ? railItems.findIndex((it) => it.kind === sel.kind && it.id === sel.id) : -1;
+      const base = idx < 0 ? (dir > 0 ? -1 : 0) : idx;
+      const next = Math.max(0, Math.min(railItems.length - 1, base + dir));
+      if (next !== idx) selectItem(railItems[next]);
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [railItems, sel, selectItem]);
 
   // Default to the first flagged area (then the first thread, then the first
   // user group); re-default when the current selection no longer exists (e.g.
@@ -279,9 +317,19 @@ function Sidebar({ areas, threads, userGroups, sel, onSelect, width = 360, showA
   // visible so the auditor can still see how much is hidden behind each.
   const [collapsed, setCollapsed] = React.useState({ groups: false, areas: false, threads: false });
   const toggle = (k) => setCollapsed((c) => ({ ...c, [k]: !c[k] }));
+  // Keep the selected rail item in view as ↑/↓ keyboard navigation walks the
+  // column (and when a deep-link from another screen selects an off-screen item).
+  // `selRef` is attached to whichever button is the current selection; `nearest`
+  // makes it a no-op when that button is already visible, so plain clicks don't
+  // jump the rail. Mirrors the dossier's currentRowRef recentering.
+  const selRef = React.useRef(null);
+  React.useEffect(() => {
+    const el = selRef.current;
+    if (el) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }, [sel]);
   return (
     <div style={{ width, overflow: 'auto', flexShrink: 0 }}>
-      <UserGroupRail userGroups={userGroups} sel={sel} onSelect={onSelect} collapsed={collapsed.groups} onToggle={() => toggle('groups')} />
+      <UserGroupRail userGroups={userGroups} sel={sel} onSelect={onSelect} selRef={selRef} collapsed={collapsed.groups} onToggle={() => toggle('groups')} />
 
       {/* Flagged areas are AI-derived (narrator suspicions), so the whole
           section — head and all — is hidden while AI flags are off rather than
@@ -297,6 +345,7 @@ function Sidebar({ areas, threads, userGroups, sel, onSelect, width = 360, showA
         return (
         <button
           key={a.area_id}
+          ref={sel?.kind === 'area' && sel.id === a.area_id ? selRef : undefined}
           onClick={() => onSelect({ kind: 'area', id: a.area_id })}
           style={{ ...railBtn(accent, sel?.kind === 'area' && sel.id === a.area_id), opacity: dismissed ? 0.62 : 1 }}
         >
@@ -309,7 +358,6 @@ function Sidebar({ areas, threads, userGroups, sel, onSelect, width = 360, showA
             <L mono size={10} color={WF.ink3}>{(a.commit_shas || []).length} commits</L>
           </div>
           <L size={13} weight={600}>{anon(a.title)}</L>
-          <L mono size={10} color={WF.ink3}>{anon(a.agent_id)}{a.reviewed_by_opus ? ' · opus✓' : ''}</L>
         </button>
         );
       })}
@@ -320,6 +368,7 @@ function Sidebar({ areas, threads, userGroups, sel, onSelect, width = 360, showA
       {!collapsed.threads && threads.map((t) => (
         <button
           key={t.thread_id}
+          ref={sel?.kind === 'thread' && sel.id === t.thread_id ? selRef : undefined}
           onClick={() => onSelect({ kind: 'thread', id: t.thread_id })}
           style={railBtn(themeColor(t.theme), sel?.kind === 'thread' && sel.id === t.thread_id)}
         >
@@ -341,7 +390,7 @@ function Sidebar({ areas, threads, userGroups, sel, onSelect, width = 360, showA
 // annotations it carries; the trailing row creates a new empty group, which the
 // auditor can then tag items into. Member/annotation/flag state is read live
 // from the overlays so the rail tracks tagging done anywhere in the app.
-function UserGroupRail({ userGroups, sel, onSelect, collapsed = false, onToggle }) {
+function UserGroupRail({ userGroups, sel, onSelect, selRef, collapsed = false, onToggle }) {
   const { groupTagsOverlay = {}, flaggedOverlay = {}, userNotesOverlay = {}, createUserGroup } = useData();
   const memberIndex = React.useMemo(() => reverseTagIndex(groupTagsOverlay), [groupTagsOverlay]);
   return (
@@ -363,6 +412,7 @@ function UserGroupRail({ userGroups, sel, onSelect, collapsed = false, onToggle 
         return (
           <button
             key={g.id}
+            ref={active ? selRef : undefined}
             onClick={() => onSelect({ kind: 'usergroup', id: g.id })}
             style={railBtn(g.color || WF.ink2, active)}
           >
@@ -482,9 +532,6 @@ function AreaDetail({ area, onOpenCommit }) {
             {area.flag_level}
           </Chip>
           <Chip style={{ fontSize: 12 }}>{area.category}</Chip>
-          <Chip style={{ fontSize: 12 }}>intent: {anon(area.intent_hypothesis)}</Chip>
-          <L mono size={11} color={WF.ink3}>{anon(area.agent_id)}</L>
-          {area.reviewed_by_opus && <Chip>opus reviewed</Chip>}
           {dismissed && <Chip bg={WF.paperAlt} color={WF.ink2}>dismissed</Chip>}
           <div style={{ flex: 1 }} />
           <Chip
@@ -516,7 +563,7 @@ function AreaDetail({ area, onOpenCommit }) {
         />
       </div>
       <TextBlock label="reasoning" text={area.reasoning} accent={WF.heat4} />
-      {area.opus_addendum && <TextBlock label="opus addendum" text={area.opus_addendum} accent={WF.ink2} />}
+      {area.opus_addendum && <TextBlock label="addendum" text={area.opus_addendum} accent={WF.ink2} />}
 
       <MemberSuspicionsSummary shas={area.commit_shas || []} />
       <CommitStrip shas={area.commit_shas || []} onOpenCommit={onOpenCommit} />
@@ -589,10 +636,8 @@ function ThreadProgression({ shas, beats = {}, accent = WF.heat3, onOpenCommit, 
     setState({ status: 'loading', commits: [], error: null });
 
     Promise.all(shas.map(async (sha) => {
-      const r = await fetch(`/api/diff?sha=${encodeURIComponent(sha)}${nameParam(selectedInput)}`);
-      const text = await r.text();
-      if (!r.ok) throw new Error(text || `HTTP ${r.status}`);
-      return { sha, parsed: parseDiff(text) };
+      const parsed = await loadLazyCommitDiff(sha, selectedInput);
+      return { sha, parsed };
     }))
       .then((commits) => { if (!cancelled) setState({ status: 'ready', commits, error: null }); })
       .catch((err) => { if (!cancelled) setState({ status: 'error', commits: [], error: err.message }); });
@@ -686,7 +731,7 @@ function ThreadCommit({ sha, parsed, index, total, note, accent = WF.heat3, onOp
           )}
           {parsed.commitMessage && <CommitHeader text={parsed.commitMessage} />}
           {parsed.logs.length > 0 && (
-            <LogDiffTable files={parsed.logs} hint="trace artifacts updated by this commit" />
+            <LogDiffTable files={parsed.logs} hint="trace artifacts updated by this commit" sha={sha} />
           )}
           {!hasDiff && <L mono size={11} color={WF.ink3}>no file changes (commit metadata only)</L>}
         </div>
@@ -1396,10 +1441,8 @@ function useAreaProgression(shas) {
     setState({ status: 'loading', byPath: [], logsByCommit: [], error: null });
 
     Promise.all(shas.map(async (sha) => {
-      const r = await fetch(`/api/diff?sha=${encodeURIComponent(sha)}${nameParam(selectedInput)}`);
-      const text = await r.text();
-      if (!r.ok) throw new Error(text || `HTTP ${r.status}`);
-      return { sha, parsed: parseDiff(text) };
+      const parsed = await loadLazyCommitDiff(sha, selectedInput);
+      return { sha, parsed };
     }))
       .then((commits) => {
         if (cancelled) return;

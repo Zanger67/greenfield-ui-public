@@ -3,15 +3,24 @@
 // commit-level navigation. Every processed trace ships a standardized set of
 // files (see CLAUDE.md / the trace README): under `main_results/` a
 // `final_report.md` plus the result figures, and at the root the blue-team
-// audit report and the experiment description / guide. This screen surfaces
-// exactly those — README.md is excluded (it documents the package layout, not
-// the experiment).
+// audit report and the experiment description / guide. Beyond that standardized
+// set the screen also surfaces whatever a trace ships under
+// `supplemental_materials/` (any files — PDFs, images, markdown), and the
+// package-level "other docs" (CLAUDE.md / AGENTS.md / README.md) when present.
 //
 // These are static files, not commit-derived, so the screen fetches them
 // directly from the trace's data dir (`/data/<input>/…`) rather than going
-// through the data store. It tolerates a trace missing any given file: a
-// missing doc is greyed out in the nav, and the plots section only lists the
-// figures that actually load.
+// through the data store — except the supplemental file *listing*, whose
+// open-ended filenames ride along in /data/index.json (see vite.config's
+// listSupplemental) and reach the screen via the data store's currentTrace.
+//
+// Missing-file handling differs by doc, by design (see each doc's `onMissing`):
+//   * the standardized result/process docs (final report, plots, experiment
+//     description, guide) always show in the nav — greyed and badged "(none)"
+//     when the trace doesn't ship them, so the expected set stays legible;
+//   * everything else — the blue-team report, the supplemental files, and the
+//     other docs — is omitted entirely when absent (no empty section header).
+// The plots section only lists the figures that actually load either way.
 import React from 'react';
 import {
   WF,
@@ -48,19 +57,76 @@ export const docKey = (id) => `doc:${id}`;
 // read these back, and the resolver in Tagging.jsx routes them.
 export const plotKey = (file) => `plot:${file}`;
 
-// The documents this screen renders, in reading order: result deliverables
-// first (front-loaded salience), then the audit verdict, then the process /
-// instruction docs. `kind: 'plots'` is the synthetic figure-gallery entry; the
-// rest are Markdown files fetched from the path shown. Exported as RESULTS_DOCS
-// so the overview can label a `doc:<id>` markup without re-declaring the set.
-const DOCS = [
-  { id: 'final_report', kind: 'md', label: 'Final report', path: 'main_results/final_report.md', group: 'Results', blurb: "researcher's writeup" },
-  { id: 'plots', kind: 'plots', label: 'Result plots', path: 'main_results/', group: 'Results', blurb: 'output figures' },
-  { id: 'blue_team', kind: 'md', label: 'Blue-team report', path: 'blue_team_report.md', group: 'Audit', blurb: 'audit verdict' },
-  { id: 'experiment', kind: 'md', label: 'Experiment description', path: 'experiment_description.md', group: 'Process & instructions', blurb: 'question + budget' },
-  { id: 'guide', kind: 'md', label: 'Guide to experiments', path: 'guide_to_my_experiments.md', group: 'Process & instructions', blurb: 'how experiments run' },
+// Group labels used by the nav, in render order. Supplemental sits directly
+// above "other docs", per the screen's reading order.
+const GROUP_SUPP = 'Supplemental materials';
+const GROUP_OTHER = 'Other docs';
+
+// How the nav treats a doc the trace doesn't ship:
+//   'none' — keep it in the nav, greyed + badged "(none)" (the standardized set,
+//            so the expected artifacts stay legible even when one is absent);
+//   'hide' — drop it entirely (no row, and no empty section header).
+// The standardized result/process docs are 'none'; the blue-team report, the
+// supplemental files, and the other docs are 'hide'.
+
+// The standardized documents, in reading order: result deliverables first
+// (front-loaded salience), then the audit verdict, then the process / instruction
+// docs. `kind: 'plots'` is the synthetic figure-gallery entry; the rest are
+// Markdown files fetched from the path shown.
+const STANDARD_DOCS = [
+  { id: 'final_report', kind: 'md', label: 'Final report', path: 'main_results/final_report.md', group: 'Results', blurb: "researcher's writeup", onMissing: 'none' },
+  { id: 'plots', kind: 'plots', label: 'Result plots', path: 'main_results/', group: 'Results', blurb: 'output figures', onMissing: 'none' },
+  { id: 'blue_team', kind: 'md', label: 'Blue-team report', path: 'blue_team_report.md', group: 'Audit', blurb: 'audit verdict', onMissing: 'hide' },
+  { id: 'experiment', kind: 'md', label: 'Experiment description', path: 'experiment_description.md', group: 'Process & instructions', blurb: 'question + budget', onMissing: 'none' },
+  { id: 'guide', kind: 'md', label: 'Guide to experiments', path: 'guide_to_my_experiments.md', group: 'Process & instructions', blurb: 'how experiments run', onMissing: 'none' },
 ];
-export const RESULTS_DOCS = DOCS;
+
+// Package-level docs that frame the trace but aren't experiment output. Shown
+// only when present (README.md used to be excluded outright; it now lives here
+// alongside the agent-instruction docs). All fetched from the trace root.
+const OTHER_DOCS = [
+  { id: 'doc_claude', kind: 'md', label: 'CLAUDE.md', path: 'CLAUDE.md', group: GROUP_OTHER, blurb: 'agent instructions', onMissing: 'hide' },
+  { id: 'doc_agents', kind: 'md', label: 'AGENTS.md', path: 'AGENTS.md', group: GROUP_OTHER, blurb: 'agent handoff schema', onMissing: 'hide' },
+  { id: 'doc_readme', kind: 'md', label: 'README.md', path: 'README.md', group: GROUP_OTHER, blurb: 'package layout', onMissing: 'hide' },
+];
+
+// The static, known docs — exported as RESULTS_DOCS so the overview / export can
+// label a `doc:<id>` markup without re-declaring the set. Supplemental files are
+// dynamic (per-trace) so they aren't here; collectDocMarkups picks those up off
+// the overlay keys directly.
+export const RESULTS_DOCS = [...STANDARD_DOCS, ...OTHER_DOCS];
+
+// Image extensions the gallery / doc viewer renders inline as <img>.
+const IMG_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp', 'avif'];
+// Text-ish extensions rendered as Markdown (.md) or preformatted text.
+const TEXT_EXTS = ['txt', 'log', 'csv', 'tsv', 'json', 'jsonl', 'yaml', 'yml'];
+
+// The doc `kind` for a supplemental file, by extension: markdown → 'md' (rendered
+// like the other markdown docs), images → 'image', PDFs → 'pdf' (the embedded
+// reader), other text → 'text' (preformatted), anything else → 'file' (an
+// open/download link). Drives both the viewer switch and the fetch decision
+// (only 'md'/'text' need their body pulled in).
+function kindForFile(name) {
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  if (ext === 'md' || ext === 'markdown') return 'md';
+  if (ext === 'pdf') return 'pdf';
+  if (IMG_EXTS.includes(ext)) return 'image';
+  if (TEXT_EXTS.includes(ext)) return 'text';
+  return 'file';
+}
+
+// A short nav blurb for a supplemental file — its type, then the extension.
+function suppBlurb(name) {
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  const kind = kindForFile(name);
+  const noun = kind === 'md' ? 'markdown' : kind === 'image' ? 'image' : kind === 'pdf' ? 'PDF' : kind === 'text' ? 'text' : 'file';
+  return ext ? `${noun} · .${ext}` : noun;
+}
+
+// The id under which a supplemental file's markups + selection are keyed. Its
+// relative path keeps it unique within the trace; the `supp:` prefix is what
+// collectDocMarkups keys off to resolve a path back for export.
+const suppId = (rel) => `supp:${rel}`;
 
 // Figures emitted under main_results/. The comparison_* bars and iteration_*
 // line charts are the two plot families plotting.py produces per task/actor.
@@ -74,7 +140,11 @@ export const PLOT_FILES = [
   'iteration_lines_math_olympiad_qwen3-14b-local.png',
 ];
 
-const MD_DOCS = DOCS.filter((d) => d.kind === 'md');
+// Docs whose body the screen fetches up front (so availability is "did the text
+// load" and the viewer has it ready): the markdown + preformatted-text kinds.
+// Image / PDF / opaque-file docs aren't fetched — they render from their URL, and
+// for supplemental files their presence is already known from the listing.
+const needsText = (d) => d.kind === 'md' || d.kind === 'text';
 
 // Fetch a text artifact, returning null for a miss. Vite's dev SPA fallback
 // answers a missing static file with index.html at HTTP 200 / text/html, so
@@ -124,16 +194,47 @@ function humanizePlot(file) {
 }
 
 export function WireResults() {
-  const { selectedInput, areaFocus, recordFocus, flaggedOverlay = {}, userNotesOverlay = {} } = useData();
+  const { selectedInput, currentTrace, areaFocus, recordFocus, flaggedOverlay = {}, userNotesOverlay = {} } = useData();
   const { settings, setPaneWidth } = useSettings();
   const navWidth = settings.paneWidths.resultsNav;
   const auditorWidth = settings.paneWidths.auditorPanel;
 
   const [status, setStatus] = React.useState('loading'); // loading | ready
-  const [docs, setDocs] = React.useState({});            // id → text (md docs only)
+  const [docs, setDocs] = React.useState({});            // id → text (md / text docs)
   const [plots, setPlots] = React.useState([]);          // [{ file, url }] that loaded
   const [selId, setSelId] = React.useState('final_report');
   const docScrollRef = React.useRef(null);
+
+  // Supplemental files shipped by the selected trace, from the manifest (see
+  // listSupplemental in vite.config). A stable string key drives the load effect
+  // + the memo so a same-contents array doesn't churn either.
+  const suppList = React.useMemo(
+    () => (Array.isArray(currentTrace?.supplemental) ? currentTrace.supplemental : []),
+    [currentTrace],
+  );
+  const suppKey = suppList.join('\n');
+
+  // One nav entry per supplemental file, kind derived from its extension. These
+  // sit in their own section, directly above the "other docs" section.
+  const suppDocs = React.useMemo(
+    () => suppList.map((rel) => ({
+      id: suppId(rel),
+      kind: kindForFile(rel),
+      label: rel,
+      path: `supplemental_materials/${rel}`,
+      group: GROUP_SUPP,
+      blurb: suppBlurb(rel),
+      onMissing: 'hide',
+    })),
+    [suppKey], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+
+  // The full nav set in render order: standardized docs, then supplemental files,
+  // then the package-level other docs.
+  const docList = React.useMemo(
+    () => [...STANDARD_DOCS, ...suppDocs, ...OTHER_DOCS],
+    [suppDocs],
+  );
 
   React.useEffect(() => {
     if (!selectedInput) return undefined;
@@ -141,8 +242,10 @@ export function WireResults() {
     setStatus('loading');
     setDocs({});
     setPlots([]);
+    // Fetch the body of every text-bearing doc (markdown + preformatted); image /
+    // PDF / opaque-file docs render from their URL, so they're not fetched here.
     const textP = Promise.all(
-      MD_DOCS.map((d) => fetchDoc(dataUrl(selectedInput, d.path)).then((t) => [d.id, t])),
+      docList.filter(needsText).map((d) => fetchDoc(dataUrl(selectedInput, d.path)).then((t) => [d.id, t])),
     );
     const plotP = Promise.all(
       PLOT_FILES.map((f) => {
@@ -156,17 +259,20 @@ export function WireResults() {
       const loadedPlots = plotResults.filter(Boolean);
       setDocs(map);
       setPlots(loadedPlots);
-      const has = (d) => (d.kind === 'plots' ? loadedPlots.length > 0 : !!map[d.id]);
+      // Availability for the keep/first-pick: text docs by loaded body, plots by
+      // count, and image/PDF/file docs (supplemental) by their presence in the
+      // listing — they're in docList only because the manifest named them.
+      const has = (d) => (d.kind === 'plots' ? loadedPlots.length > 0 : needsText(d) ? !!map[d.id] : true);
       setSelId((cur) => {
-        const keep = DOCS.find((d) => d.id === cur && has(d));
+        const keep = docList.find((d) => d.id === cur && has(d));
         if (keep) return cur;
-        const first = DOCS.find(has);
+        const first = docList.find(has);
         return first ? first.id : cur;
       });
       setStatus('ready');
     });
     return () => { cancelled = true; };
-  }, [selectedInput]);
+  }, [selectedInput, suppKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Deep-link target: the overview routes a flagged/annotated doc here as a
   // `doc:<id>` focus token (see openDoc). Select that doc when the token names a
@@ -174,8 +280,8 @@ export function WireResults() {
   React.useEffect(() => {
     if (!areaFocus || !areaFocus.startsWith('doc:')) return;
     const id = areaFocus.slice(4);
-    if (DOCS.some((d) => d.id === id)) setSelId(id);
-  }, [areaFocus]);
+    if (docList.some((d) => d.id === id)) setSelId(id);
+  }, [areaFocus, docList]);
 
   // Switching documents should land at the top, not inherit the prior doc's
   // scroll depth — the scroll container is reused across selections, so reset
@@ -185,7 +291,7 @@ export function WireResults() {
   }, [selId]);
 
   const isAvailable = React.useCallback(
-    (d) => (d.kind === 'plots' ? plots.length > 0 : !!docs[d.id]),
+    (d) => (d.kind === 'plots' ? plots.length > 0 : needsText(d) ? !!docs[d.id] : true),
     [docs, plots],
   );
 
@@ -212,8 +318,10 @@ export function WireResults() {
     [flaggedOverlay, userNotesOverlay],
   );
 
-  const docCount = MD_DOCS.filter((d) => docs[d.id]).length;
-  const sel = DOCS.find((d) => d.id === selId);
+  // Subtitle count: every available non-plots doc (standardized + supplemental +
+  // other), so the supplemental/other files register in the header tally too.
+  const docCount = docList.filter((d) => d.kind !== 'plots' && isAvailable(d)).length;
+  const sel = docList.find((d) => d.id === selId);
 
   return (
     <AppFrame
@@ -225,7 +333,7 @@ export function WireResults() {
       <div style={{ flex: 1, minHeight: 0, display: 'flex', overflow: 'hidden' }}>
         <ResultsNav
           width={navWidth}
-          docs={DOCS}
+          docs={docList}
           selId={selId}
           onSelect={(id) => { setSelId(id); recordFocus(`doc:${id}`); }}
           isAvailable={isAvailable}
@@ -292,12 +400,20 @@ function EmptyResults({ input }) {
 }
 
 // Left nav: documents grouped by stage, each a button that reads like the
-// screen-picker tabs (ink fill when active). Unavailable docs render dimmed and
-// non-interactive so the standardized set is always legible even when a trace
-// is missing one.
+// screen-picker tabs (ink fill when active). Missing docs render by their
+// `onMissing` policy: 'none' docs (the standardized set) stay, dimmed + badged
+// "(none)" so the expected artifacts are always legible; 'hide' docs (blue-team
+// report, supplemental files, other docs) drop out entirely. A group whose items
+// all dropped out renders no header. While still loading, 'hide' docs whose
+// availability isn't known yet are withheld rather than shown-then-vanished.
 function ResultsNav({ width, docs, selId, onSelect, isAvailable, markFor, loading }) {
+  // Decide each doc's nav fate once: keep + interactive, keep + greyed "(none)",
+  // or omit. 'hide' docs only appear once confirmed available (so they pop in
+  // rather than flicker out when the load resolves them absent).
   const groups = [];
   for (const d of docs) {
+    const available = isAvailable(d);
+    if (!available && d.onMissing === 'hide') continue;
     let g = groups.find((x) => x.name === d.group);
     if (!g) { g = { name: d.group, items: [] }; groups.push(g); }
     g.items.push(d);
@@ -358,7 +474,7 @@ function ResultsNav({ width, docs, selId, onSelect, isAvailable, markFor, loadin
                     </L>
                   )}
                   {!available && !loading && (
-                    <L mono size={9} color={active ? WF.paper : WF.ink3}>· missing</L>
+                    <L mono size={9} color={active ? WF.paper : WF.ink3}>· (none)</L>
                   )}
                 </span>
                 <L mono size={10} color={active ? WF.paper : WF.ink3}>{d.blurb}</L>
@@ -371,19 +487,76 @@ function ResultsNav({ width, docs, selId, onSelect, isAvailable, markFor, loadin
   );
 }
 
+// The reading surface for a single doc. Markdown renders as parsed Markdown;
+// `text` files render preformatted; images render inline; PDFs embed in the
+// reader; anything else (opaque file) offers an open/download link. The path
+// caption sits above all of them so the auditor always sees what they're looking
+// at. Only the standardized + other docs reach the md branch; the supplemental
+// kinds (image/pdf/text/file) come straight from the listing.
 function DocView({ doc, text, input }) {
   const anon = useAnonymize();
   const resolveImg = React.useMemo(() => makeResolveImg(input, doc.path), [input, doc.path]);
-  // scrambleText keeps every markdown sigil (#, **, `, -, |) intact, so the
-  // whole document can be scrambled before parsing and still renders with its
+  const url = dataUrl(input, doc.path);
+  // scrambleText (via anon) keeps every markdown sigil (#, **, `, -, |) intact, so
+  // the whole document can be scrambled before parsing and still renders with its
   // headings / lists / code fences / tables — just with unreadable words.
+  let body;
+  if (doc.kind === 'image') {
+    body = (
+      <a href={url} target="_blank" rel="noreferrer" title="open full size">
+        <img
+          src={url}
+          alt={anon(doc.label)}
+          style={{ display: 'block', maxWidth: '100%', height: 'auto', background: WF.paper, border: inkBorder() }}
+        />
+      </a>
+    );
+  } else if (doc.kind === 'pdf') {
+    // The embedded PDF reader. <object> renders the browser's native viewer; the
+    // child link is its fallback when inline PDF rendering is unavailable. The
+    // PDF bytes aren't anonymized (they're opaque to scrambleText) — supplemental
+    // material, not trace narration.
+    body = (
+      <>
+        <object data={url} type="application/pdf" style={{ display: 'block', width: '100%', height: '80vh', border: inkBorder() }}>
+          <L size={12} color={WF.ink3} style={{ display: 'block', padding: 12 }}>
+            This browser can&rsquo;t show the PDF inline.{' '}
+            <a href={url} target="_blank" rel="noreferrer" style={{ color: WF.ink }}>Open {doc.label} in a new tab.</a>
+          </L>
+        </object>
+        <L size={11} mono color={WF.ink3} style={{ display: 'block', marginTop: 8 }}>
+          <a href={url} target="_blank" rel="noreferrer" style={{ color: WF.ink3 }}>open full size ↗</a>
+        </L>
+      </>
+    );
+  } else if (doc.kind === 'text') {
+    body = (
+      <pre
+        style={{
+          margin: 0, padding: 14, background: WF.paperAlt, border: inkBorder(),
+          fontFamily: WF.monoFont, fontSize: 12, lineHeight: 1.6,
+          whiteSpace: 'pre-wrap', wordBreak: 'break-word', overflowX: 'auto',
+        }}
+      >{anon(text)}</pre>
+    );
+  } else if (doc.kind === 'md') {
+    body = <Markdown text={anon(text)} resolveImg={resolveImg} />;
+  } else {
+    // Opaque file — nothing to render inline, so offer the link.
+    body = (
+      <L size={13} color={WF.ink2} style={{ display: 'block' }}>
+        This file can&rsquo;t be previewed.{' '}
+        <a href={url} target="_blank" rel="noreferrer" style={{ color: WF.ink }}>Open {doc.label} ↗</a>
+      </L>
+    );
+  }
   return (
     <div style={{ padding: '24px 28px' }}>
-      <div style={{ maxWidth: 880, margin: '0 auto' }}>
-        <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 4 }}>
+      <div style={{ maxWidth: doc.kind === 'pdf' ? 1080 : 880, margin: '0 auto' }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 8 }}>
           <L size={12} mono color={WF.ink3}>{anon(doc.path)}</L>
         </div>
-        <Markdown text={anon(text)} resolveImg={resolveImg} />
+        {body}
       </div>
     </div>
   );

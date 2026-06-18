@@ -140,10 +140,19 @@ export function WireDossierInbox() {
       if (kindSel.size && !kindSel.has(c.kind)) return false;
       if (classSel.size && !classSel.has(c.fileClass)) return false;
       if (flagSel.size && !flagTokens(c).some((t) => flagSel.has(t))) return false;
-      if (q && !(c.file || '').toLowerCase().includes(q)) return false;
+      // A coalesced commit's `file` is only its first path; match the filter
+      // against every file the merge touched so the rest stay findable.
+      if (q) {
+        const paths = c.coalescedPaths && c.coalescedPaths.length ? c.coalescedPaths : [c.file || ''];
+        if (!paths.some((p) => p.toLowerCase().includes(q))) return false;
+      }
       return true;
     });
   }, [chunks, kindSel, flagSel, classSel, fileFilter]);
+
+  // Any facet narrowing the list means ↑/↓ should walk the matches, not the full
+  // chronological chunk stream the data store's global arrow handler steps through.
+  const filterActive = kindSel.size > 0 || flagSel.size > 0 || classSel.size > 0 || fileFilter.trim().length > 0;
 
   // Deterministic commit groups (from classify's commit_sidecar.jsonl) collapse
   // into one item. Selecting the group shows the cumulative diff; selecting a
@@ -219,6 +228,37 @@ export function WireDossierInbox() {
   const selectCommit = React.useCallback((id) => { scrollModeRef.current = 'center'; setGroupSel(null); navigate(id); }, [navigate]);
   const selectFromList = React.useCallback((id) => { scrollModeRef.current = 'nearest'; setGroupSel(null); navigate(id); }, [navigate]);
   const displayItems = React.useMemo(() => buildDisplayItems(filteredRows), [filteredRows]);
+
+  // Filter-scoped keyboard transport. With a filter active, ↑/← step to the
+  // previous *matching* commit and ↓/→ to the next, so arrowing the timeline
+  // never lands on a commit the filter has hidden between two visible ones. We
+  // claim the key in the capture phase and stopPropagation so the data store's
+  // global arrow handler — which walks the unfiltered chunk stream — doesn't also
+  // fire. With no filter active we don't claim the key: the global handler
+  // already walks every commit, which is the same set. Skipped in text fields /
+  // with a modifier held, mirroring both other handlers.
+  React.useEffect(() => {
+    if (!filterActive) return undefined;
+    const onKey = (e) => {
+      if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+      const t = e.target;
+      const tag = t && t.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return;
+      let dir = 0;
+      if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') dir = -1;
+      else if (e.key === 'ArrowDown' || e.key === 'ArrowRight') dir = 1;
+      else return;
+      if (filteredRows.length === 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const idx = currentId ? filteredRows.findIndex((c) => c.id === currentId) : -1;
+      const base = idx < 0 ? (dir > 0 ? -1 : 0) : idx;
+      const next = Math.max(0, Math.min(filteredRows.length - 1, base + dir));
+      if (next !== idx) selectCommit(filteredRows[next].id);
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [filterActive, filteredRows, currentId, selectCommit]);
 
   const sel = currentId ? byId[currentId] : chunks[0];
 
@@ -1009,6 +1049,11 @@ function buildDisplayItems(rows) {
   return items;
 }
 
+// How many member commits the collapsed group shows inline before the rest
+// fold into a single "… N more" ellipsis row. Click the ellipsis (or the
+// header) to open the group dossier — every commit + the full file tree.
+const MAX_INLINE_MEMBERS = 3;
+
 // Left-pane collapsed group: a regular-sized header naming the group, plus its
 // member commits as small, dimmed, indented sub-rows. Clicking the header
 // selects the group (→ cumulative diff); clicking a sub-row opens that commit.
@@ -1018,6 +1063,15 @@ function GroupRow({ group, currentGroup, currentCommitId, currentRowRef, checkou
   const { flaggedOverlay = {} } = useData();
   const meta = groupMeta(group.kind);
   const n = group.members.length;
+  // Cap the inline member list at MAX_INLINE_MEMBERS, but never hide the commit
+  // the auditor is currently parked on — if it lives past the cap, show the
+  // whole list so its row stays visible (and scroll-into-view still lands).
+  const curIdx = currentCommitId ? group.members.findIndex((m) => m.id === currentCommitId) : -1;
+  const showAllMembers = curIdx >= MAX_INLINE_MEMBERS;
+  const shownMembers = open
+    ? (showAllMembers ? group.members : group.members.slice(0, MAX_INLINE_MEMBERS))
+    : [];
+  const hiddenCount = open && !showAllMembers ? Math.max(0, n - MAX_INLINE_MEMBERS) : 0;
   const flagSummary = React.useMemo(() => groupFlagSummary(group.members), [group.members]);
   const cls = groupFileClass(group.members);
   const clsStyle = cls ? GROUP_CLASS_STYLE[cls] : null;
@@ -1112,7 +1166,7 @@ function GroupRow({ group, currentGroup, currentCommitId, currentRowRef, checkou
         <Stamp size={11} color={WF.ink3} style={{ textAlign: 'right' }}>{fmtClock(group.tStart)}</Stamp>
       </div>
 
-      {open && group.members.map((m) => {
+      {shownMembers.map((m) => {
         const isCur = m.id === currentCommitId;
         const isHead = checkout && checkout.lastSha && m.sha === checkout.lastSha;
         const mark = memberFlagMark(m);
@@ -1155,6 +1209,23 @@ function GroupRow({ group, currentGroup, currentCommitId, currentRowRef, checkou
           </div>
         );
       })}
+
+      {hiddenCount > 0 && (
+        <div
+          onClick={onSelectGroup}
+          title={`${hiddenCount} more — open the group to see all ${n} commits and the full file tree`}
+          style={{
+            padding: '3px 12px 5px 96px',
+            cursor: 'pointer',
+            userSelect: 'none',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          <L size={11} color={WF.ink3} weight={600}>
+            … {hiddenCount} more {hiddenCount === 1 ? 'commit' : 'commits'}
+          </L>
+        </div>
+      )}
     </div>
   );
 }
@@ -1171,23 +1242,35 @@ function groupAnnotationCount(data, group) {
 
 const memberPath = (m) => m.file || m.title || '';
 
+// Every path a member contributes to the tree. A coalesced commit (the parser
+// merged a run of consecutive .log/.jsonl writes into it) stands in for writes
+// to several files — `m.coalescedPaths` — so it expands into one path per
+// touched file; an ordinary commit yields its single path. Keeps the group's
+// file tree honest about what the merged commit actually changed.
+const memberPaths = (m) => (m.coalescedPaths && m.coalescedPaths.length ? m.coalescedPaths : [memberPath(m)]);
+
 // Build a directory tree from the members' file paths. Each directory node
 // holds child dirs (`children`) and the files living directly in it (`leaves`,
-// each keeping its member commit so the row stays clickable + typed). A file
-// touched twice (e.g. created then later modified) pushes two leaves under the
-// same dir, so repeats survive as sibling rows rather than being collapsed.
+// each keeping its member commit so the row stays clickable + typed, plus the
+// leaf's own path so a coalesced commit's several leaves tooltip correctly). A
+// file touched twice (e.g. created then later modified) pushes two leaves under
+// the same dir, so repeats survive as sibling rows rather than being collapsed.
 function buildMemberTree(members) {
   const root = { name: '', children: new Map(), leaves: [] };
-  const sorted = [...members].sort((a, b) => memberPath(a).localeCompare(memberPath(b)));
-  for (const m of sorted) {
-    const segs = memberPath(m).split('/').filter(Boolean);
+  // One (path, member) entry per touched file — a coalesced commit contributes
+  // several — then lay them out sorted by path.
+  const entries = [];
+  for (const m of members) for (const p of memberPaths(m)) entries.push({ path: p, member: m });
+  entries.sort((a, b) => a.path.localeCompare(b.path));
+  for (const { path, member } of entries) {
+    const segs = path.split('/').filter(Boolean);
     let node = root;
     for (let i = 0; i < segs.length - 1; i++) {
       const dir = segs[i];
       if (!node.children.has(dir)) node.children.set(dir, { name: dir, children: new Map(), leaves: [] });
       node = node.children.get(dir);
     }
-    node.leaves.push({ name: segs[segs.length - 1] || memberPath(m), member: m });
+    node.leaves.push({ name: segs[segs.length - 1] || path, member, path });
   }
   return root;
 }
@@ -1233,13 +1316,13 @@ function flattenMemberTree(root) {
       if (it.dir) {
         const { label, terminalLeaf, node: inner } = collapseDir(it.dir);
         if (terminalLeaf) {
-          rows.push({ kind: 'leaf', key: `l${n++}`, prefix: conn, label, member: terminalLeaf.member, path: memberPath(terminalLeaf.member) });
+          rows.push({ kind: 'leaf', key: `l${n++}`, prefix: conn, label, member: terminalLeaf.member, path: terminalLeaf.path });
         } else {
           rows.push({ kind: 'dir', key: `d${n++}`, prefix: conn, label: `${label}/` });
           walk(inner, prefix + (last ? '    ' : '│   '));
         }
       } else {
-        rows.push({ kind: 'leaf', key: `l${n++}`, prefix: conn, label: it.leaf.name, member: it.leaf.member, path: memberPath(it.leaf.member) });
+        rows.push({ kind: 'leaf', key: `l${n++}`, prefix: conn, label: it.leaf.name, member: it.leaf.member, path: it.leaf.path });
       }
     });
   };
@@ -1569,17 +1652,17 @@ function GroupDossier({ group, onSelectCommit }) {
 function CumulativeDiffPanel({ from, to, collapsible = false, defaultOpen = true }) {
   const { selectedInput } = useData();
   const [open, setOpen] = React.useState(collapsible ? defaultOpen : true);
-  const [state, setState] = React.useState({ status: 'loading', text: '', error: null });
+  const [state, setState] = React.useState({ status: 'loading', parsed: null, error: null });
+  const runRef = React.useRef(0);
 
   const fetchDiff = React.useCallback(async () => {
-    setState({ status: 'loading', text: '', error: null });
+    const run = ++runRef.current;
+    setState({ status: 'loading', parsed: null, error: null });
     try {
-      const r = await fetch(`/api/groupdiff?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${nameParam(selectedInput)}`);
-      const text = await r.text();
-      if (!r.ok) throw new Error(text || `HTTP ${r.status}`);
-      setState({ status: 'ready', text, error: null });
+      const parsed = await loadLazyGroupDiff(from, to, selectedInput);
+      if (run === runRef.current) setState({ status: 'ready', parsed, error: null });
     } catch (err) {
-      setState({ status: 'error', text: '', error: err.message });
+      if (run === runRef.current) setState({ status: 'error', parsed: null, error: err.message });
     }
   }, [from, to, selectedInput]);
 
@@ -1587,7 +1670,7 @@ function CumulativeDiffPanel({ from, to, collapsible = false, defaultOpen = true
   // summary costs nothing until the auditor expands it.
   React.useEffect(() => { if (open) fetchDiff(); }, [fetchDiff, open]);
 
-  const parsed = React.useMemo(() => (state.status === 'ready' ? parseDiff(state.text) : null), [state.status, state.text]);
+  const parsed = state.status === 'ready' ? state.parsed : null;
 
   return (
     <Box style={{ padding: 12 }}>
@@ -1624,6 +1707,8 @@ function CumulativeDiffPanel({ from, to, collapsible = false, defaultOpen = true
             <LogDiffTable
               files={parsed.logs}
               hint="trace artifacts accumulated across the group"
+              sha={to}
+              oldSha={`${from}~1`}
             />
           )}
           {parsed.logs.length === 0 && parsed.other.length === 0 && (
@@ -2060,7 +2145,7 @@ function DossierBody({ chunk, byId, checkedOut, pendingCheckout, checkoutEnabled
             surface it as a first-class "output" block — the pane file's git diff
             (green/red), between the shell context and git diff boxes. The git
             diff box's log table then defers to this with a "see above". */}
-        {panePath && <PaneOutputBox diff={diff} panePath={panePath} />}
+        {panePath && <PaneOutputBox diff={diff} panePath={panePath} sha={chunk.sha} />}
 
         {chunk.sha && <DiffPanel sha={chunk.sha} diff={diff} panePath={panePath} />}
       </div>
@@ -2364,48 +2449,68 @@ function SuspicionsPanel({ suspicions, agg, byId, currentId, onNavigate, dismiss
   // readable but the warning prominence goes away.
   const borderColor = dismissed ? WF.rule2 : style.bg;
   const background = dismissed ? WF.paperAlt : WF.tint;
+  // The level + category already lead each SuspicionDetail, so the panel no
+  // longer stacks a header above them. Its group-level bits (agreement count,
+  // dismissed state, dismiss toggle) ride the right edge of the FIRST detail's
+  // chip row instead — so the dismiss button stays in line and never pushes the
+  // content down. A lone suspicion renders that chip row at the old header's
+  // title size so the box doesn't read as lopsided.
+  const controls = ((agg?.agreement_count > 1) || dismissed || onDismiss) ? (
+    <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+      {agg?.agreement_count > 1 && <Chip>{agg.agreement_count} agents agree</Chip>}
+      {dismissed && <Chip bg={WF.paperAlt} color={WF.ink2}>dismissed</Chip>}
+      {onDismiss && (
+        <Chip
+          onClick={onDismiss}
+          style={{ cursor: 'pointer', background: dismissed ? WF.paper : WF.paperAlt, color: WF.ink2 }}
+          title={dismissed
+            ? 'restore this suspicion — also visible from overview and the semantic-areas screen'
+            : 'dismiss: I looked, this is fine — clears it from the overview list and semantic-areas screen too'}
+        >{dismissed ? '↩ restore' : '✕ dismiss'}</Chip>
+      )}
+    </div>
+  ) : null;
   return (
     <Box style={{ padding: 12, borderColor, background, borderWidth: 2, opacity: dismissed ? 0.78 : 1 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-        <Chip style={{ background: dismissed ? WF.heat2 : style.bg, color: style.fg, borderColor: dismissed ? WF.heat2 : style.bg, fontSize: 13, padding: '3px 8px' }}>
-          {style.label} suspicion
-        </Chip>
-        {agg?.agreement_count > 1 && <Chip>{agg.agreement_count} agents agree</Chip>}
-        {agg?.category_mode && <Chip>{agg.category_mode}</Chip>}
-        {dismissed && <Chip bg={WF.paperAlt} color={WF.ink2}>dismissed</Chip>}
-        <div style={{ flex: 1 }} />
-        {onDismiss && (
-          <Chip
-            onClick={onDismiss}
-            style={{ cursor: 'pointer', background: dismissed ? WF.paper : WF.paperAlt, color: WF.ink2 }}
-            title={dismissed
-              ? 'restore this suspicion — also visible from overview and the semantic-areas screen'
-              : 'dismiss: I looked, this is fine — clears it from the overview list and semantic-areas screen too'}
-          >{dismissed ? '↩ restore' : '✕ dismiss'}</Chip>
-        )}
-      </div>
-      <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
         {suspicions.map((s, i) => (
-          <SuspicionDetail key={s.suspicion_id || i} s={s} byId={byId} currentId={currentId} onNavigate={onNavigate} dimmed={dismissed} />
+          <SuspicionDetail
+            key={s.suspicion_id || i}
+            s={s}
+            byId={byId}
+            currentId={currentId}
+            onNavigate={onNavigate}
+            dimmed={dismissed}
+            prominent={suspicions.length === 1}
+            headerExtra={i === 0 ? controls : null}
+          />
         ))}
       </div>
     </Box>
   );
 }
 
-export function SuspicionDetail({ s, byId, currentId, onNavigate, dimmed }) {
+export function SuspicionDetail({ s, byId, currentId, onNavigate, dimmed, prominent, headerExtra }) {
   const anon = useAnonymize();
   const lvl = LEVEL_STYLE[s.flag_level] || LEVEL_STYLE.low;
   // When the surrounding suspicion is dismissed, drop the entry's red border
   // accent to a muted heat — same content, demoted prominence.
   const accent = dimmed ? WF.heat2 : lvl.bg;
+  // `prominent` marks the sole suspicion in a panel: its chip row stands in for
+  // the header that used to sit above it, so size the chips up to that old title.
+  // `headerExtra` (the panel's dismiss/agreement controls) rides the right edge
+  // of this same row so it stays in line rather than pushing content down.
+  const titleChip = prominent ? { fontSize: 13, padding: '3px 8px' } : undefined;
   return (
     <div style={{ borderLeft: `4px solid ${accent}`, paddingLeft: 10 }}>
       <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-        <Chip style={{ background: accent, color: lvl.fg, borderColor: accent }}>{lvl.label}</Chip>
-        {s.category && <Chip>{s.category}</Chip>}
-        {s.intent_hypothesis && s.intent_hypothesis !== 'unclear' && (
-          <Chip>intent: {anon(s.intent_hypothesis)}</Chip>
+        <Chip style={{ background: accent, color: lvl.fg, borderColor: accent, ...titleChip }}>{lvl.label}</Chip>
+        {s.category && <Chip style={titleChip}>{s.category}</Chip>}
+        {headerExtra && (
+          <>
+            <div style={{ flex: 1, minWidth: 12 }} />
+            {headerExtra}
+          </>
         )}
       </div>
       {s.commit_commentary && (
@@ -2643,25 +2748,25 @@ function GroupAnnotations({ group, onSelectCommit, style }) {
 // Returns 'idle' for an empty sha so callers can mount it unconditionally.
 function useCommitDiff(sha) {
   const { selectedInput } = useData();
-  const [state, setState] = React.useState({ status: 'loading', text: '', error: null });
+  const [state, setState] = React.useState({ status: 'loading', parsed: null, error: null });
+  // Bumped on every (re)fetch so a slow stat→bodies pair from a previous sha
+  // can't clobber the current one when it finally resolves.
+  const runRef = React.useRef(0);
 
   const fetchDiff = React.useCallback(async () => {
-    if (!sha) { setState({ status: 'idle', text: '', error: null }); return; }
-    setState({ status: 'loading', text: '', error: null });
+    if (!sha) { setState({ status: 'idle', parsed: null, error: null }); return; }
+    const run = ++runRef.current;
+    setState({ status: 'loading', parsed: null, error: null });
     try {
-      const r = await fetch(`/api/diff?sha=${encodeURIComponent(sha)}${nameParam(selectedInput)}`);
-      const text = await r.text();
-      if (!r.ok) throw new Error(text || `HTTP ${r.status}`);
-      setState({ status: 'ready', text, error: null });
+      const parsed = await loadLazyCommitDiff(sha, selectedInput);
+      if (run === runRef.current) setState({ status: 'ready', parsed, error: null });
     } catch (err) {
-      setState({ status: 'error', text: '', error: err.message });
+      if (run === runRef.current) setState({ status: 'error', parsed: null, error: err.message });
     }
   }, [sha, selectedInput]);
 
   React.useEffect(() => { fetchDiff(); }, [fetchDiff]);
-
-  const parsed = React.useMemo(() => (state.status === 'ready' ? parseDiff(state.text) : null), [state.status, state.text]);
-  return { ...state, parsed, reload: fetchDiff };
+  return { ...state, reload: fetchDiff };
 }
 
 // The pane log a user-shell command wrote to lives at
@@ -2683,7 +2788,8 @@ function findPaneFile(parsed, session) {
 // as its git diff (changed lines, green/red) rather than raw text, pulled from
 // the same shared commit-diff parse the git-diff box uses. Sits between the
 // shell-context and git-diff boxes; the git-diff box's log table defers to it.
-function PaneOutputBox({ diff, panePath }) {
+function PaneOutputBox({ diff, panePath, sha }) {
+  const { selectedInput } = useData();
   const anon = useAnonymize();
   const [full, setFull] = React.useState(false);
   const { status, parsed } = diff;
@@ -2691,14 +2797,42 @@ function PaneOutputBox({ diff, panePath }) {
     () => (parsed && panePath ? [...parsed.logs, ...parsed.other].find((f) => f.path === panePath) : null),
     [parsed, panePath],
   );
+  // The pane log is often large, so it arrives unloaded; this box exists to show
+  // it, so fetch its body on demand (a small pane log is already loaded).
+  const [lazyBody, setLazyBody] = React.useState(null);
+  const [lazyStatus, setLazyStatus] = React.useState('idle'); // idle | loading | error
+  React.useEffect(() => { setLazyBody(null); setLazyStatus('idle'); }, [panePath, sha]);
+  React.useEffect(() => {
+    if (!(file && file.loaded === false && lazyBody == null && lazyStatus === 'idle' && sha && !file.isBinary)) return;
+    let alive = true;
+    setLazyStatus('loading');
+    const qs = `base=${encodeURIComponent(`${sha}~1`)}&target=${encodeURIComponent(sha)}`
+      + `&path=${encodeURIComponent(file.path)}&context=3${nameParam(selectedInput)}`;
+    (async () => {
+      try {
+        const r = await fetch(`/api/filediff?${qs}`);
+        const text = await r.text();
+        if (!r.ok) throw new Error();
+        const one = [...parseDiff(text).logs, ...parseDiff(text).other][0];
+        if (alive) { setLazyBody(one ? one.body : []); setLazyStatus('ready'); }
+      } catch { if (alive) setLazyStatus('error'); }
+    })();
+    return () => { alive = false; };
+  }, [file, lazyBody, lazyStatus, sha, selectedInput]);
+  const effBody = lazyBody != null ? lazyBody : (file ? file.body : []);
   // Only the changed (+/−) lines — pane logs are append-heavy, so the diff reads
   // as mostly green; same treatment as the git-diff box's log-file rows.
   const changed = React.useMemo(
-    () => (file ? file.body.filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---) /.test(l)) : []),
-    [file],
+    () => effBody.filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---) /.test(l)),
+    [effBody],
   );
   if (status === 'loading') return <LoadingBox label="loading output" height={48} />;
-  if (status !== 'ready' || !file || changed.length === 0) return null;
+  if (status !== 'ready' || !file) return null;
+  // Unloaded large pane log still fetching its body — keep the box present.
+  if (file.loaded === false && lazyBody == null) {
+    return lazyStatus === 'error' ? null : <LoadingBox label="loading output" height={48} />;
+  }
+  if (changed.length === 0) return null;
   const adds = changed.filter((l) => /^\+/.test(l)).length;
   const dels = changed.filter((l) => /^-/.test(l)).length;
   const bigLog = changed.length > BIG_FILE_LINES;
@@ -2773,6 +2907,7 @@ function DiffPanel({ sha, diff, panePath }) {
             <LogDiffTable
               files={parsed.logs}
               panePath={panePath}
+              sha={sha}
             />
           )}
           {parsed.logs.length === 0 && parsed.other.length === 0 && (
@@ -2880,6 +3015,127 @@ export const PREVIEW_LINES = 30;    // lines shown up front for a big file
 const MANY_FILES = 15;       // files in one diff before they render as a list
 const TOTAL_LINES = 1200;    // summed hunk-body lines before files render as a list
 
+// ── Lazy diff loading ──────────────────────────────────────────────────────
+// Rather than pull a commit's whole `git show` patch (which for a merged
+// .log/.jsonl commit can be megabytes) the diff panels do two cheap passes:
+//   1. /api/diffstat → every file's path + added/deleted counts (numstat), no
+//      bodies. Files over LARGE_DIFF_LINES changed lines stay collapsed.
+//   2. /api/diff?paths=… → the bodies of just the small files, in one git call.
+// A large file's body is fetched only if the auditor opens it (FileDiff /
+// LogDiffRow load it on demand via /api/filediff). mergeStatBodies rebuilds the
+// exact {commitMessage, logs, other} shape parseDiff returns, so every renderer
+// is unchanged save for honoring `large`/`loaded` on each file.
+const LARGE_DIFF_LINES = BIG_FILE_LINES; // changed lines (added+deleted) past which a file stays collapsed
+
+// new- / old-path for a numstat rename token: `a => b`, or the brace form
+// `dir/{a => b}/f`. Plain paths pass straight through.
+function renameSide(token, side /* 'new' | 'old' */) {
+  if (!token.includes('=>')) return token;
+  const brace = token.match(/^(.*)\{(.*) => (.*)\}(.*)$/);
+  if (brace) return (brace[1] + (side === 'new' ? brace[3] : brace[2]) + brace[4]).replace(/\/{2,}/g, '/');
+  const plain = token.match(/^(.*) => (.*)$/);
+  return plain ? (side === 'new' ? plain[2] : plain[1]).trim() : token;
+}
+
+// Parse `git show/diff --numstat --summary` (no patch bodies): the commit
+// message (empty for a group diff) and one entry per file with its added/deleted
+// counts (null for binary) and create/delete/rename status.
+export function parseDiffStat(text) {
+  const msg = [];
+  const byPath = new Map();
+  const order = [];
+  for (const raw of text.split('\n')) {
+    const m = raw.match(/^(\d+|-)\t(\d+|-)\t(.+)$/);
+    if (m) {
+      const path = renameSide(m[3], 'new');
+      const isRename = m[3].includes('=>');
+      const f = {
+        path,
+        added: m[1] === '-' ? null : parseInt(m[1], 10),
+        deleted: m[2] === '-' ? null : parseInt(m[2], 10),
+        isBinary: m[1] === '-' && m[2] === '-',
+        isNew: false,
+        isDeleted: false,
+        isRename,
+        renameFrom: isRename ? renameSide(m[3], 'old') : null,
+      };
+      byPath.set(path, f);
+      order.push(f);
+      continue;
+    }
+    if (/^ {4}/.test(raw)) { msg.push(raw.slice(4)); continue; }
+    const s = raw.match(/^ (create|delete) mode \d+ (.+)$/);
+    if (s) {
+      const f = byPath.get(s[2]);
+      if (f) { if (s[1] === 'create') f.isNew = true; else f.isDeleted = true; }
+    }
+  }
+  return { commitMessage: msg.join('\n').trim(), files: order };
+}
+
+const statTotal = (f) => (f.added || 0) + (f.deleted || 0);
+
+// Merge a stat pass with the batch-fetched small-file bodies (parseDiff output,
+// keyed by path) into parseDiff's {commitMessage, logs, other} shape. Large
+// files come back unloaded (empty body, loaded:false) carrying their numstat
+// counts + synthesized meta so the row renders without a body.
+function mergeStatBodies(stat, bodyByPath) {
+  const files = stat.files.map((s) => {
+    const meta = [];
+    if (s.isNew) meta.push('new file mode 100644');
+    if (s.isDeleted) meta.push('deleted file mode 100644');
+    if (s.isRename && s.renameFrom) { meta.push(`rename from ${s.renameFrom}`); meta.push(`rename to ${s.path}`); }
+    const big = !s.isBinary && statTotal(s) > LARGE_DIFF_LINES;
+    if (big) {
+      return { path: s.path, meta, body: [], isBinary: false, added: s.added ?? 0, deleted: s.deleted ?? 0, large: true, loaded: false };
+    }
+    const got = bodyByPath.get(s.path);
+    if (got) return { ...got, added: s.added ?? 0, deleted: s.deleted ?? 0, large: false, loaded: true };
+    // Small file with no batched body (binary, empty, or a pathspec miss): render
+    // from the stat alone.
+    return { path: s.path, meta, body: [], isBinary: s.isBinary, added: s.added ?? 0, deleted: s.deleted ?? 0, large: false, loaded: true };
+  });
+  return {
+    commitMessage: stat.commitMessage,
+    logs: files.filter((f) => /^logs\//.test(f.path)),
+    other: files.filter((f) => !/^logs\//.test(f.path)),
+  };
+}
+
+async function fetchDiffText(url) {
+  const r = await fetch(url);
+  const text = await r.text();
+  if (!r.ok) throw new Error(text || `HTTP ${r.status}`);
+  return text;
+}
+
+// Bodies of the small files only, via one batched /api/diff (or /api/groupdiff)
+// restricted to their paths. `bodyUrl` already carries the sha/range + name.
+async function fetchSmallBodies(stat, bodyUrl) {
+  const small = stat.files.filter((s) => !s.isBinary && statTotal(s) <= LARGE_DIFF_LINES);
+  const byPath = new Map();
+  if (!small.length) return byPath;
+  const paths = encodeURIComponent(small.map((s) => s.path).join('\n'));
+  const parsed = parseDiff(await fetchDiffText(`${bodyUrl}&paths=${paths}`));
+  for (const f of [...parsed.other, ...parsed.logs]) byPath.set(f.path, f);
+  return byPath;
+}
+
+// Two-phase load of one commit's diff: stat first, then just the small bodies.
+export async function loadLazyCommitDiff(sha, name) {
+  const stat = parseDiffStat(await fetchDiffText(`/api/diffstat?sha=${encodeURIComponent(sha)}${nameParam(name)}`));
+  const bodyByPath = await fetchSmallBodies(stat, `/api/diff?sha=${encodeURIComponent(sha)}${nameParam(name)}`);
+  return mergeStatBodies(stat, bodyByPath);
+}
+
+// Same two-phase load for a group's cumulative diff (from~1 … to).
+export async function loadLazyGroupDiff(from, to, name) {
+  const range = `from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${nameParam(name)}`;
+  const stat = parseDiffStat(await fetchDiffText(`/api/groupdiffstat?${range}`));
+  const bodyByPath = await fetchSmallBodies(stat, `/api/groupdiff?${range}`);
+  return mergeStatBodies(stat, bodyByPath);
+}
+
 // Per-file context-expansion steps for FileDiff's up/down buttons — the count of
 // surrounding lines each press reveals in that direction. The fetch hands
 // max(up,down) to /api/filediff as `-U<n>`; the last step is a large value git
@@ -2892,7 +3148,13 @@ export function DiffGroup({ title, accent, files, sha, oldSha, hint, hideHeader 
   // Triggered by file count OR cumulative line count — many small files add up
   // to the same DOM blowup as a few big ones. Each row expands its own diff on
   // click; "expand all" opens the lot.
-  const totalLines = React.useMemo(() => files.reduce((n, f) => n + f.body.length, 0), [files]);
+  // Sized from numstat counts (large files arrive unloaded with an empty body,
+  // so f.body.length would read 0); fall back to body length for legacy
+  // full-fetch files that carry no count.
+  const totalLines = React.useMemo(
+    () => files.reduce((n, f) => n + (f.added != null ? statTotal(f) : f.body.length), 0),
+    [files],
+  );
   const listMode = files.length > MANY_FILES || totalLines > TOTAL_LINES;
   // Per-file open state. A heavy (listMode) commit defaults every file collapsed
   // — the list is meant to be scanned, then drilled into. A normal commit
@@ -2901,11 +3163,15 @@ export function DiffGroup({ title, accent, files, sha, oldSha, hint, hideHeader 
   // Reset to the per-mode default whenever the file set changes — i.e. a new
   // commit is opened — which also clears stale indices from the previous commit.
   const filesKey = React.useMemo(() => files.map((f) => f.path).join(' '), [files]);
-  const [openIdx, setOpenIdx] = React.useState(
-    () => (listMode ? new Set() : new Set(files.map((_, i) => i))),
+  // Small files default open; `large` ones stay collapsed so we never auto-fetch
+  // a big body the auditor hasn't asked to see.
+  const defaultOpenSet = React.useCallback(
+    () => (listMode ? new Set() : new Set(files.map((_, i) => i).filter((i) => !files[i].large))),
+    [listMode, files],
   );
+  const [openIdx, setOpenIdx] = React.useState(defaultOpenSet);
   React.useEffect(() => {
-    setOpenIdx(listMode ? new Set() : new Set(files.map((_, i) => i)));
+    setOpenIdx(defaultOpenSet());
   }, [filesKey, listMode]); // eslint-disable-line react-hooks/exhaustive-deps
   const toggleIdx = (i) =>
     setOpenIdx((s) => { const n = new Set(s); n.has(i) ? n.delete(i) : n.add(i); return n; });
@@ -2954,7 +3220,7 @@ export function DiffGroup({ title, accent, files, sha, oldSha, hint, hideHeader 
 // Logs are append-heavy trace artifacts, so dropping the hunk headers and
 // context lines keeps the box scannable; the per-commit FileDiff treatment
 // (with images, full context) is reserved for source files.
-export function LogDiffTable({ files, hint, panePath }) {
+export function LogDiffTable({ files, hint, panePath, sha, oldSha }) {
   const border = `1px solid ${WF.rule}`;
   // The whole log-files box folds away from its header — append-heavy trace
   // artifacts are rarely the thing under audit, so let them be tucked out of the
@@ -2983,7 +3249,7 @@ export function LogDiffTable({ files, hint, panePath }) {
             </colgroup>
             <tbody>
               {files.map((f, i) => (
-                <LogDiffRow key={f.path + ':' + i} file={f} first={i === 0} border={border} isPane={f.path === panePath} />
+                <LogDiffRow key={f.path + ':' + i} file={f} first={i === 0} border={border} isPane={f.path === panePath} sha={sha} oldSha={oldSha} />
               ))}
             </tbody>
           </table>
@@ -2993,21 +3259,55 @@ export function LogDiffTable({ files, hint, panePath }) {
   );
 }
 
-function LogDiffRow({ file, first, border, isPane }) {
+function LogDiffRow({ file, first, border, isPane, sha, oldSha }) {
+  const { selectedInput } = useData();
   const anon = useAnonymize();
   const [full, setFull] = React.useState(false);
-  const adds = file.body.filter((l) => /^\+[^+]/.test(l)).length;
-  const dels = file.body.filter((l) => /^-[^-]/.test(l)).length;
+  // An unloaded `large` log holds its body back until the auditor asks for it —
+  // logs are the heaviest payloads. `wantBody` flips on the "load" click; a
+  // small/loaded log (no `loaded:false`) renders immediately.
+  const [wantBody, setWantBody] = React.useState(file.loaded !== false);
+  const [lazyBody, setLazyBody] = React.useState(null);
+  const [lazyStatus, setLazyStatus] = React.useState('idle'); // idle | loading | error
+  React.useEffect(() => {
+    setWantBody(file.loaded !== false); setLazyBody(null); setLazyStatus('idle'); setFull(false);
+  }, [file.path, sha, oldSha, file.loaded]);
+  React.useEffect(() => {
+    if (!(wantBody && file.loaded === false && lazyBody == null && lazyStatus === 'idle'
+          && !file.isBinary && sha)) return;
+    let alive = true;
+    setLazyStatus('loading');
+    const base = oldSha || `${sha}~1`;
+    const qs = `base=${encodeURIComponent(base)}&target=${encodeURIComponent(sha)}`
+      + `&path=${encodeURIComponent(file.path)}&context=3${nameParam(selectedInput)}`;
+    (async () => {
+      try {
+        const r = await fetch(`/api/filediff?${qs}`);
+        const text = await r.text();
+        if (!r.ok) throw new Error();
+        const one = [...parseDiff(text).logs, ...parseDiff(text).other][0];
+        if (alive) { setLazyBody(one ? one.body : []); setLazyStatus('ready'); }
+      } catch { if (alive) setLazyStatus('error'); }
+    })();
+    return () => { alive = false; };
+  }, [wantBody, file.loaded, lazyBody, lazyStatus, file.isBinary, file.path, sha, oldSha, selectedInput]);
+
+  const loaded = file.loaded !== false || lazyBody != null;
+  const effectiveBody = lazyBody != null ? lazyBody : file.body;
+  const adds = file.added != null ? file.added : effectiveBody.filter((l) => /^\+[^+]/.test(l)).length;
+  const dels = file.deleted != null ? file.deleted : effectiveBody.filter((l) => /^-[^-]/.test(l)).length;
   const isNew = file.meta.some((l) => /^new file mode/.test(l));
   const isDeleted = file.meta.some((l) => /^deleted file mode/.test(l));
   // Only the changed lines — additions and deletions. Hunk headers (@@) and
   // unchanged context lines are dropped: log diffs are mostly appends, so the
   // +/− lines carry the signal.
-  const changed = file.body.filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---) /.test(l));
+  const changed = effectiveBody.filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---) /.test(l));
   // Log appends can run to thousands of lines; the row has no scroll cap, so
   // preview-then-expand keeps a single noisy log from freezing the panel.
   const bigLog = changed.length > BIG_FILE_LINES;
   const shown = bigLog && !full ? changed.slice(0, PREVIEW_LINES) : changed;
+  const unloadedLarge = file.large && !loaded;
+  const sizeLines = unloadedLarge ? adds + dels : changed.length;
   const cell = { borderTop: first ? 'none' : border, verticalAlign: 'top' };
   return (
     <tr>
@@ -3018,7 +3318,7 @@ function LogDiffRow({ file, first, border, isPane }) {
           <L mono size={11} weight={700} style={{ wordBreak: 'break-all' }}>{anon(file.path)}</L>
           {adds > 0 && <L mono size={11} color={WF.tagGreenFg}>+{adds}</L>}
           {dels > 0 && <L mono size={11} color={WF.heat4}>−{dels}</L>}
-          {bigLog && <Chip style={{ background: WF.tagAmberBg, borderColor: WF.tagAmberFg }}>large · {changed.length} lines</Chip>}
+          {(bigLog || unloadedLarge) && <Chip style={{ background: WF.tagAmberBg, borderColor: WF.tagAmberFg }}>large · {sizeLines} lines</Chip>}
           {file.isBinary && <Chip>binary</Chip>}
           {isNew && <Chip>new file</Chip>}
           {isDeleted && <Chip>deleted</Chip>}
@@ -3033,6 +3333,18 @@ function LogDiffRow({ file, first, border, isPane }) {
           </L>
         ) : file.isBinary ? (
           <L mono size={11} color={WF.ink3} style={{ display: 'block', padding: '8px 10px' }}>binary file — no line diff</L>
+        ) : unloadedLarge ? (
+          // Held back from the batch load; fetch this one log's diff on demand.
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px' }}>
+            {lazyStatus === 'loading' ? (
+              <L mono size={11} color={WF.ink3}>loading log diff…</L>
+            ) : lazyStatus === 'error' ? (
+              <L mono size={11} color={WF.heat4}>failed to load — </L>
+            ) : null}
+            {lazyStatus !== 'loading' && (
+              <Chip style={{ cursor: 'pointer' }} onClick={() => setWantBody(true)}>load log diff · {adds + dels} lines</Chip>
+            )}
+          </div>
         ) : changed.length > 0 ? (
           <>
             <ColoredDiffBody lines={shown} maxHeight={null} />
@@ -3191,20 +3503,35 @@ export function FileDiff({ file, sha, oldSha, collapsible = false, open = false,
   const [upIdx, setUpIdx] = React.useState(null);
   const [downIdx, setDownIdx] = React.useState(null);
   const [fetched, setFetched] = React.useState({ status: 'idle', body: null, error: null });
+  // A `large` file arrives unloaded (empty body); its patch is fetched only when
+  // the auditor opens it. `lazyBody` holds that fetched body and `effectiveBody`
+  // is whichever body we actually have. A file with no `loaded` field (the legacy
+  // full-fetch path, e.g. the stepwise sequence view) counts as loaded.
+  const [lazyBody, setLazyBody] = React.useState(null);
+  const [lazyStatus, setLazyStatus] = React.useState('idle'); // idle | loading | error
+  const loaded = file.loaded !== false || lazyBody != null;
+  const effectiveBody = lazyBody != null ? lazyBody : file.body;
   // Gaps the auditor has filled, keyed by their new-file line range. A different
   // commit / file gets a clean slate — gap keys are line numbers, so a stale set
   // wouldn't match anyway, but resetting also drops the full-file fetch below.
   const [expandedGaps, setExpandedGaps] = React.useState(() => new Set());
   const [gapFetch, setGapFetch] = React.useState({ status: 'idle', map: null });
-  React.useEffect(() => { setExpandedGaps(new Set()); }, [sha, oldSha, file.path]);
-  const adds = file.body.filter((l) => /^\+[^+]/.test(l)).length;
-  const dels = file.body.filter((l) => /^-[^-]/.test(l)).length;
+  React.useEffect(() => {
+    setExpandedGaps(new Set());
+    setLazyBody(null);
+    setLazyStatus('idle');
+  }, [sha, oldSha, file.path]);
+  // Counts come from numstat (file.added/deleted) when present, so a `large` file
+  // shows its size before its body loads; fall back to the body for legacy files.
+  const adds = file.added != null ? file.added : effectiveBody.filter((l) => /^\+[^+]/.test(l)).length;
+  const dels = file.deleted != null ? file.deleted : effectiveBody.filter((l) => /^-[^-]/.test(l)).length;
   const isImage = IMAGE_EXT_RE.test(file.path);
   const isNew = file.meta.some((l) => /^new file mode/.test(l));
   const isDeleted = file.meta.some((l) => /^deleted file mode/.test(l));
   // Expansion only reveals surrounding *unchanged* lines, so it's meaningless
-  // for images/binaries and for whole-file adds/deletes (no context to show).
-  const canExpand = !isImage && !file.isBinary && !isNew && !isDeleted && file.body.length > 0;
+  // for images/binaries and for whole-file adds/deletes (no context to show) —
+  // and only once the body is loaded.
+  const canExpand = loaded && !isImage && !file.isBinary && !isNew && !isDeleted && effectiveBody.length > 0;
 
   const upLines = upIdx == null ? 3 : CTX_STEPS[upIdx];
   const downLines = downIdx == null ? 3 : CTX_STEPS[downIdx];
@@ -3272,8 +3599,8 @@ export function FileDiff({ file, sha, oldSha, collapsible = false, open = false,
   const activeBody = React.useMemo(() => (
     expandActive && fetched.status === 'ready' && fetched.body
       ? trimHunks(fetched.body, upLines, downLines)
-      : file.body
-  ), [expandActive, fetched.status, fetched.body, upLines, downLines, file.body]);
+      : effectiveBody
+  ), [expandActive, fetched.status, fetched.body, upLines, downLines, effectiveBody]);
 
   // The body actually rendered, plus the gap markers ColoredDiffBody draws.
   // We walk the hunks of `activeBody`: the unchanged run between hunk i-1 and i
@@ -3340,10 +3667,35 @@ export function FileDiff({ file, sha, oldSha, collapsible = false, open = false,
   const bodyLines = activeBody.length;
   const isBig = !isImage && !file.isBinary && bodyLines > BIG_FILE_LINES;
   const showBody = hideHeader || (collapsible ? open : true);
+  // Fetch a `large` file's body the first time it's opened (its patch was held
+  // back from the batch load). One file's diff at the committed ±3 context, via
+  // the same endpoint the context-expansion controls use.
+  React.useEffect(() => {
+    if (!(showBody && file.loaded === false && lazyBody == null && lazyStatus === 'idle'
+          && !isImage && !file.isBinary)) return;
+    let alive = true;
+    setLazyStatus('loading');
+    const base = oldSha || `${sha}~1`;
+    const qs = `base=${encodeURIComponent(base)}&target=${encodeURIComponent(sha)}`
+      + `&path=${encodeURIComponent(file.path)}&context=3${nameParam(selectedInput)}`;
+    (async () => {
+      try {
+        const r = await fetch(`/api/filediff?${qs}`);
+        const text = await r.text();
+        if (!r.ok) throw new Error(text || `HTTP ${r.status}`);
+        const one = [...parseDiff(text).other, ...parseDiff(text).logs][0];
+        if (alive) { setLazyBody(one ? one.body : []); setLazyStatus('ready'); }
+      } catch {
+        if (alive) setLazyStatus('error');
+      }
+    })();
+    return () => { alive = false; };
+  }, [showBody, file.loaded, lazyBody, lazyStatus, sha, oldSha, file.path, selectedInput, isImage, file.isBinary]);
   // A new file with no hunk body is an empty (0-byte) file — git emits the
   // `new file mode` header but no `+` lines. Flag it so we can say so explicitly
-  // instead of leaving a bare header with nothing under it.
-  const isEmptyNewFile = isNew && !isImage && !file.isBinary && bodyLines === 0;
+  // instead of leaving a bare header with nothing under it. Only once loaded —
+  // an unloaded large file also has bodyLines 0 but is not empty.
+  const isEmptyNewFile = loaded && isNew && !isImage && !file.isBinary && bodyLines === 0;
 
   const emptyFileNote = (
     <L mono size={11} color={WF.ink3} style={{ display: 'block', padding: '8px 10px', fontStyle: 'italic' }}>
@@ -3355,6 +3707,11 @@ export function FileDiff({ file, sha, oldSha, collapsible = false, open = false,
   // its directional context controls. Shared by the boxed (header) layout and
   // the bare hideHeader layout the change-by-change step uses.
   const bodyContent = showBody && (
+    !loaded ? (
+      lazyStatus === 'error'
+        ? <L mono size={11} color={WF.heat4} style={{ display: 'block', padding: '8px 10px' }}>failed to load diff</L>
+        : <LoadingBox label="loading diff" height={48} style={{ margin: 0 }} />
+    ) :
     isImage ? (
       <ImageDiff sha={sha} oldSha={oldSha} path={file.path} hasOld={!isNew} hasNew={!isDeleted} />
     ) : isBig && !full ? (
@@ -3444,7 +3801,11 @@ export function FileDiff({ file, sha, oldSha, collapsible = false, open = false,
         <div style={{ flex: 1 }} />
         {!isImage && adds > 0 && <L mono size={11} color={WF.tagGreenFg}>+{adds}</L>}
         {!isImage && dels > 0 && <L mono size={11} color={WF.heat4}>−{dels}</L>}
-        {isBig && <Chip style={{ background: WF.tagAmberBg, borderColor: WF.tagAmberFg }}>large · {bodyLines} lines</Chip>}
+        {(isBig || (file.large && !loaded)) && (
+          <Chip style={{ background: WF.tagAmberBg, borderColor: WF.tagAmberFg }}>
+            large · {file.large && !loaded ? adds + dels : bodyLines} lines{file.large && !loaded ? ' · click to load' : ''}
+          </Chip>
+        )}
         {file.isBinary && !isImage && <Chip>binary</Chip>}
         {isImage && <Chip>image</Chip>}
         {isNew && <Chip>new file</Chip>}

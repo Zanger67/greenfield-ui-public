@@ -286,7 +286,9 @@ paths, the trace label) while preserving its silhouette — line breaks, indenta
 +/- gutters, word lengths.
 
 ### Faster navigation
-- **Arrow keys** — `←/↑` previous commit, `→/↓` next, walking chronological order.
+- **Arrow keys** — on the timeline, `←/↑` previous commit, `→/↓` next, walking
+  chronological order. On threads & groups, `↑/↓` step up/down the left rail
+  (groups → flagged areas → threads).
 - **Browser history** — navigation (screen + selected commit/area/thread) rides the
   history stack, so back / forward / reload land you where you left off.
 - **Resizable panes** — drag the thin dividers between panes; double-click a divider

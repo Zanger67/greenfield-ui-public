@@ -187,17 +187,19 @@ function deriveFile(source, rl) {
 // Data/results artifacts the researcher produces — distinct from source
 // content. Extensions are matched case-insensitively. `json`/`jsonl` count as
 // data here even though some are config: in these traces they are almost
-// always eval results / metadata dumps.
+// always eval results / metadata dumps. `log` and `txt` are run output /
+// scratch dumps — and the parser's `data_write_sequence` grouping treats both
+// as data-write extensions, so the UI's class must agree.
 const DATA_EXTS = new Set([
   'json', 'jsonl', 'csv', 'tsv', 'parquet', 'arrow', 'feather',
   'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'pdf',
   'npy', 'npz', 'pt', 'pth', 'ckpt', 'safetensors', 'bin',
-  'pkl', 'pickle', 'h5', 'hdf5', 'log',
+  'pkl', 'pickle', 'h5', 'hdf5', 'log', 'txt',
 ]);
 // Source content the researcher authors.
 const CODE_EXTS = new Set([
   'py', 'pyi', 'ipynb', 'js', 'jsx', 'ts', 'tsx', 'sh', 'bash', 'zsh',
-  'md', 'rst', 'txt', 'toml', 'yaml', 'yml', 'cfg', 'ini', 'env',
+  'md', 'rst', 'toml', 'yaml', 'yml', 'cfg', 'ini', 'env',
   'html', 'css', 'scss', 'c', 'cc', 'cpp', 'h', 'hpp', 'rs', 'go',
   'java', 'rb', 'lock', 'sql', 'r',
 ]);
@@ -227,6 +229,16 @@ function deriveTitle(kind, file, source, rl) {
   }
   if (file) return file;
   return source;
+}
+
+// Headline for a coalesced data-write commit: the single file (with the merge
+// count) when the run touched one file, else "<n> files (×<count> writes
+// merged)". Keeps the inbox row and the group-tree fallback readable even
+// though the merged commit has no raw_line to derive a title from.
+function coalescedTitle(paths, count) {
+  const merged = count > 1 ? ` (×${count} writes merged)` : '';
+  if (paths.length === 1) return `${paths[0]}${merged}`;
+  return `${paths.length} files${merged}`;
 }
 
 function deriveSummary(kind, source, rl) {
@@ -483,19 +495,27 @@ function buildDataset({ name, events, bashIndex, flags, suspicions, aggSuspicion
     }
   }
   // Index suspicions per-sha (multiple agents may flag the same commit).
+  // Producers sometimes abbreviate inner_commit_sha (the LLM copies git's short
+  // form), so resolve every artifact SHA to the full event SHA before keying —
+  // otherwise an abbreviated key never matches the full-SHA event lookup below
+  // and the suspicion silently drops off its commit. resolveSha returns the SHA
+  // unchanged when already full, the unique full SHA for a prefix, and null when
+  // ambiguous/unknown (then we fall back to the raw value = prior behaviour).
   const susBySha = {};
   for (const s of suspicions) {
-    const sha = s?.inner_commit_sha;
+    const sha = resolveSha(s?.inner_commit_sha) || s?.inner_commit_sha;
     if (sha) (susBySha[sha] = susBySha[sha] || []).push(s);
   }
   const aggBySha = {};
   for (const a of aggSuspicions) {
-    if (a?.inner_commit_sha) aggBySha[a.inner_commit_sha] = a;
+    const sha = resolveSha(a?.inner_commit_sha) || a?.inner_commit_sha;
+    if (sha) aggBySha[sha] = a;
   }
   // Index bash context by sha.
   const bashBySha = {};
   for (const b of bashIndex) {
-    if (b?.inner_commit_sha) bashBySha[b.inner_commit_sha] = b;
+    const sha = resolveSha(b?.inner_commit_sha) || b?.inner_commit_sha;
+    if (sha) bashBySha[sha] = b;
   }
   // Index descriptive annotations (annotation_agent). Commit-targeted ones join
   // onto a commit by sha; group-targeted ones join onto a sidecar group by
@@ -506,7 +526,8 @@ function buildDataset({ name, events, bashIndex, flags, suspicions, aggSuspicion
     if (a?.target_kind === 'group' && a.group_id) {
       (annoByGroup[a.group_id] = annoByGroup[a.group_id] || []).push(a);
     } else if (a?.inner_commit_sha) {
-      (annoBySha[a.inner_commit_sha] = annoBySha[a.inner_commit_sha] || []).push(a);
+      const sha = resolveSha(a.inner_commit_sha) || a.inner_commit_sha;
+      (annoBySha[sha] = annoBySha[sha] || []).push(a);
     }
   }
   // Index semantic threads by member sha so a commit's dossier can denote which
@@ -532,11 +553,23 @@ function buildDataset({ name, events, bashIndex, flags, suspicions, aggSuspicion
   const chunks = events.map((e) => {
     const rl = safeParseRawLine(e.raw_line);
     const source = e.source;
-    const kind = deriveKind(source, rl);
+    // A coalesced log/data-write commit — the parser merges a run of consecutive
+    // .log (cross-file) or .jsonl (same-file) writes into one commit — ships an
+    // empty raw_line and lists every file the run touched in `coalesced_paths`
+    // on the event entry. Without recovering that, the chunk would derive as a
+    // pathless SYNC row titled by its source ("audit"); instead treat it as a
+    // data MODIFY whose representative file is the first path, and keep the full
+    // list so the group file tree can show every touched file.
+    const coalescedPaths = Array.isArray(e.coalesced_paths) && e.coalesced_paths.length
+      ? e.coalesced_paths : null;
+    const coalescedCount = coalescedPaths ? (e.coalesced_count || coalescedPaths.length) : 0;
+    const kind = coalescedPaths ? 'MODIFY' : deriveKind(source, rl);
     const kindLabel = deriveKindLabel(kind, source);
-    const file = deriveFile(source, rl);
+    const file = coalescedPaths ? coalescedPaths[0] : deriveFile(source, rl);
     const fileClass = deriveFileClass(file);  // 'code' | 'data' | null
-    const title = deriveTitle(kind, file, source, rl);
+    const title = coalescedPaths
+      ? coalescedTitle(coalescedPaths, coalescedCount)
+      : deriveTitle(kind, file, source, rl);
     const summary = deriveSummary(kind, source, rl);
     const t = parseTs(e.ts);
     const sha = e.inner_commit_sha || '';
@@ -588,6 +621,12 @@ function buildDataset({ name, events, bashIndex, flags, suspicions, aggSuspicion
       groupIndex: side?.group_index ?? 0,
       groupKind: side?.group_kind ?? null,         // 'edit_sequence' | 'dir_deletion'
       groupRoot: side?.group_root ?? null,         // shared path / deleted directory
+      // Coalesced data-write run: the parser merged this run of consecutive
+      // .log/.jsonl writes into one commit. `coalescedPaths` is every file it
+      // touched (the group file tree expands one leaf per path); `coalescedCount`
+      // is how many member writes it stands for. null/0 for an ordinary commit.
+      coalescedPaths,                              // [path, …] | null
+      coalescedCount,                              // member writes merged (0 if none)
       // Synthetic fields kept for shared components:
       suspicion: flagLevel ? 1 : (preFlag ? 0.5 : 0),
       h: heatBucket,
@@ -703,8 +742,15 @@ export function DataProvider({ children }) {
         if (cancelled) return;
         const list = Array.isArray(json?.inputs) ? json.inputs : [];
         const normalised = list.map((it) => (typeof it === 'string'
-          ? { name: it, label: it, source: 'public/data' }
-          : { name: it.name, label: it.label || it.name, source: it.source || 'public/data' }));
+          ? { name: it, label: it, source: 'public/data', supplemental: [] }
+          : {
+            name: it.name,
+            label: it.label || it.name,
+            source: it.source || 'public/data',
+            // Files under the trace's supplemental_materials/ (see vite.config's
+            // listSupplemental); the results screen lists + opens them.
+            supplemental: Array.isArray(it.supplemental) ? it.supplemental : [],
+          }));
         setInputs(normalised);
         if (normalised.length === 0) return;
         // Restore priority, narrowest match first:
@@ -1039,10 +1085,12 @@ export function DataProvider({ children }) {
 
   // Keyboard transport: ← / ↑ step to the previous commit chronologically, → / ↓
   // to the next. Chunks are stored in chronological order, so this walks that
-  // order regardless of the active screen's filters. Skipped while focus is in a
-  // text field (so notes keep their own cursor) or a modifier is held (don't
-  // shadow browser/OS shortcuts); on the spine, arrows otherwise just scroll, so
-  // we preventDefault once we've claimed the key.
+  // order — the unfiltered default. A screen may pre-empt it in the capture phase
+  // (the areas rail, and the dossier when a filter is active, both register a
+  // capture-phase listener that stopPropagation()s to walk their own scoped set).
+  // Skipped while focus is in a text field (so notes keep their own cursor) or a
+  // modifier is held (don't shadow browser/OS shortcuts); on the spine, arrows
+  // otherwise just scroll, so we preventDefault once we've claimed the key.
   React.useEffect(() => {
     const onKey = (e) => {
       if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;

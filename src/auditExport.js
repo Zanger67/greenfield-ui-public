@@ -135,11 +135,28 @@ export function collectSemanticMarkups(semanticAreas, threads, flaggedOverlay, u
   return out;
 }
 
-// Result-document markups (`doc:<id>` overlay keys).
+// Result-document markups (`doc:<id>` overlay keys). The static result/other
+// docs (RESULTS_DOCS) supply nice labels + paths; supplemental files are dynamic
+// (per-trace, keyed `doc:supp:<relpath>`) so they aren't in that set — any other
+// `doc:` key carrying a flag / note / group-tag is swept in too, with its path
+// and label recovered from the key, so dynamic docs still export.
 export function collectDocMarkups(flaggedOverlay, userNotesOverlay, includeKeys = EMPTY_KEYS) {
-  const out = [];
+  const metaByKey = new Map();
   for (const d of RESULTS_DOCS) {
-    const key = docKey(d.id);
+    metaByKey.set(docKey(d.id), { docId: d.id, path: d.path || null, title: d.label });
+  }
+  for (const key of new Set([...Object.keys(flaggedOverlay), ...Object.keys(userNotesOverlay), ...includeKeys])) {
+    if (!key.startsWith('doc:') || metaByKey.has(key)) continue;
+    const id = key.slice(4);
+    const isSupp = id.startsWith('supp:');
+    metaByKey.set(key, {
+      docId: id,
+      path: isSupp ? `supplemental_materials/${id.slice(5)}` : null,
+      title: isSupp ? id.slice(5) : id.replace(/_/g, ' '),
+    });
+  }
+  const out = [];
+  for (const [key, meta] of metaByKey) {
     const userFlagged = !!flaggedOverlay[key];
     const userNotes = userNotesOverlay[key] || [];
     if (!userFlagged && userNotes.length === 0 && !includeKeys.has(key)) continue;
@@ -147,12 +164,12 @@ export function collectDocMarkups(flaggedOverlay, userNotesOverlay, includeKeys 
       id: key,                                    // synthetic id; never routed as a chunk id
       _docKey: key,
       _isDoc: true,
-      _docId: d.id,
+      _docId: meta.docId,
       kind: 'document',
       sha: null,
-      file: d.path || null,
-      title: d.label,
-      summary: `result artifact${d.path ? ' · ' + d.path : ''}`,
+      file: meta.path,
+      title: meta.title,
+      summary: `result artifact${meta.path ? ' · ' + meta.path : ''}`,
       flagged: userFlagged,
       userFlagged,
       userNotes,

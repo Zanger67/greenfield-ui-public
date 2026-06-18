@@ -517,7 +517,6 @@ function OverviewRow({ chunk, onOpen, onDismiss, showNotes, showSuspicions, acce
               <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
                 <Chip bg={susAccent} color={WF.onAccent}>{s.flag_level}</Chip>
                 <Chip>{s.category}</Chip>
-                <L mono size={10} color={WF.ink3}>{anon(s.agent_id)}</L>
               </div>
               <L size={12} style={{ display: 'block', marginTop: 4, whiteSpace: 'pre-wrap' }}>{anon(s.commit_commentary)}</L>
             </div>

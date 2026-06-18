@@ -49,9 +49,15 @@ function InputSelector() {
           cursor: 'pointer',
         }}
       >
-        {inputs.map((i) => (
-          <option key={i.name} value={i.name}>{anon(i.label || i.name)}</option>
-        ))}
+        {inputs.map((i) => {
+          // Trace labels (date-prefixed dir names / ui_names) can run long and
+          // stretch the top bar; clip the displayed text to 60 chars with an
+          // ellipsis. The full label stays in the hover title and `value` is the
+          // untouched `name`, so selection / path resolution are unaffected.
+          const label = anon(i.label || i.name);
+          const clipped = label.length > 60 ? `${label.slice(0, 59)}…` : label;
+          return <option key={i.name} value={i.name} title={label}>{clipped}</option>;
+        })}
       </select>
     </label>
   );
@@ -60,10 +66,10 @@ function InputSelector() {
 export function ScreenTabs() {
   const { screen, goScreen } = useData();
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-      <L size={20} weight={700}>REDLOGS</L>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'nowrap' }}>
+      <L size={20} weight={700} style={{ flexShrink: 0 }}>REDLOGS</L>
       <InputSelector />
-      <div role="tablist" style={{ display: 'flex', gap: 4 }}>
+      <div role="tablist" style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
         {SCREENS.map((s) => {
           const active = screen === s.id;
           return (

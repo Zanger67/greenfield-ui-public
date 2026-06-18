@@ -229,13 +229,22 @@ export function SessionTimer() {
 
   const toggleRun = () => {
     if (running) {
-      commit((p, ts) => ({
-        ...p,
-        state: 'paused',
-        accumulatedMs: p.accumulatedMs + Math.max(0, ts - (p.runningSince || ts)),
-        runningSince: null,
-      }), 'pause');
+      commit((p, ts) => {
+        let next = {
+          ...p,
+          state: 'paused',
+          accumulatedMs: p.accumulatedMs + Math.max(0, ts - (p.runningSince || ts)),
+          runningSince: null,
+        };
+        next = appendLog(next, 'pause');
+        // Pausing at/after 0:00 also dismisses the live alarm: calling the
+        // session by pausing should silence the beep/pulse, not just freeze
+        // the overtime counter and leave it throbbing.
+        if (alarming) next = appendLog({ ...next, alarmAck: true }, 'dismiss');
+        return next;
+      });
       logActivity('timer', { action: 'pause' });
+      if (alarming) logActivity('timer', { action: 'dismiss' });
     } else {
       const first = timer.startedAt == null;
       commit((p, ts) => ({ ...p, state: 'running', runningSince: ts, startedAt: p.startedAt ?? ts }),
