@@ -106,7 +106,7 @@ const toggleIn = (key) => (prev) => {
 };
 
 export function WireDossierInbox() {
-  const { data, showAiSuspicion, currentId, navigate, recordFocus, selectedInput, areaFocus } = useData();
+  const { data, showAiSuspicion, currentId, navigate, recordFocus, selectedInput, areaFocus, dataDrill, openDataDrill, closeDataDrill } = useData();
   // `data` is already AI-suspicion-gated at the source (DataProvider): when the
   // top-bar AI-flags pill is off, every chunk here arrives with flagLevel /
   // suspicions nulled, so the suspect filter facet, heat gutter, row badges and
@@ -114,7 +114,7 @@ export function WireDossierInbox() {
   // read only to drop the coverage pill's suspicion segment.
   const { chunks, coverage, byId } = data;
   const checkout = React.useContext(CheckoutContext);
-  const { paneWidths, setPaneWidth } = useSettings();
+  const { paneWidths, setPaneWidth, mergeDataOps } = useSettings();
 
   // Three independent filter facets, each a Set of selected tokens. An empty
   // set means "all" for that facet. Within a facet the selected tokens OR
@@ -159,6 +159,13 @@ export function WireDossierInbox() {
   // member opens that individual commit. groupSel is local — it overrides the
   // per-commit dossier without touching the global navigation model.
   const [groupSel, setGroupSel] = React.useState(null);
+
+  // The drilled data run lives in the data store as a key on the nav tuple
+  // (`dataDrill`), so opening/closing the data pane is a real back/forward step
+  // (see openDataDrill/closeDataDrill). We resolve that key to the live
+  // { type:'dataMerge' } display item below (drillItem). Swapping the left rail
+  // never touches groupSel / the open dossier, so the center pane survives a
+  // collapse/reopen; only valid while mergeDataOps is on, hence the guard.
 
   // groupId → reconstructed group descriptor, built from the unfiltered chunk
   // stream so deep-link nav (overview → group dossier via a `group:<id>` focus)
@@ -215,6 +222,11 @@ export function WireDossierInbox() {
   const contentRef = React.useRef(null);
   const currentRowRef = React.useRef(null);
   const scrollModeRef = React.useRef('center');
+  // The main list's scrollTop, stashed the instant we drill into a data run (its
+  // scroll container is about to unmount). Restored when the full list remounts
+  // so clicking back lands exactly where the auditor left off — see the
+  // restore effect below and openDataDrill.
+  const savedListScrollRef = React.useRef(0);
 
   // Fractional vertical position (0..1) of every rendered row within the
   // scrollable content, keyed by commit id. Both the heat-gutter tick marks and
@@ -227,18 +239,73 @@ export function WireDossierInbox() {
 
   const selectCommit = React.useCallback((id) => { scrollModeRef.current = 'center'; setGroupSel(null); navigate(id); }, [navigate]);
   const selectFromList = React.useCallback((id) => { scrollModeRef.current = 'nearest'; setGroupSel(null); navigate(id); }, [navigate]);
-  const displayItems = React.useMemo(() => buildDisplayItems(filteredRows), [filteredRows]);
+  // Open a group's cumulative-diff dossier from a list row (main or drilled),
+  // mirroring the per-commit selectFromList: set the local group selection and
+  // record the focus so deep-links / the overview stay in sync.
+  const openGroupFromList = React.useCallback((g) => { setGroupSel(g); recordFocus(`group:${g.id}`); }, [recordFocus]);
+  // Drill into a merged data run. Stash the live scroll position first (the main
+  // list unmounts on the next render) so reopening restores it, then push the
+  // drill onto the nav history via the store. Leaves the open dossier untouched.
+  const drillIntoData = React.useCallback((item) => {
+    savedListScrollRef.current = listRef.current?.scrollTop ?? 0;
+    openDataDrill(item.key);
+  }, [openDataDrill]);
+  // Build the chronological display items, then — when mergeDataOps is on —
+  // collapse long runs of data ops into single dataMerge cells.
+  const displayItems = React.useMemo(() => {
+    const base = buildDisplayItems(filteredRows);
+    return mergeDataOps ? collapseDataRuns(base) : base;
+  }, [filteredRows, mergeDataOps]);
+  // Resolve the store's drill key to the live merged-run display item. Null when
+  // the setting is off or the key no longer matches a run (e.g. filters changed)
+  // — both cases fall back to the full timeline gracefully.
+  const drillItem = React.useMemo(
+    () => (mergeDataOps && dataDrill
+      ? displayItems.find((it) => it.type === 'dataMerge' && it.key === dataDrill) || null
+      : null),
+    [mergeDataOps, dataDrill, displayItems],
+  );
+  // Ids of every commit collapsed inside a merge cell — arrow navigation skips
+  // these so ↑/↓ jump over a "many data file modifications" run instead of
+  // stepping through each hidden data write. Empty when mergeDataOps is off.
+  const mergedIds = React.useMemo(() => {
+    const s = new Set();
+    for (const it of displayItems) {
+      if (it.type === 'dataMerge') for (const c of it.chunks) s.add(c.id);
+    }
+    return s;
+  }, [displayItems]);
+  // Select a commit from inside the drill. The FIRST hop in — when the open
+  // selection isn't part of this run, i.e. we're sitting on the "drill open,
+  // nothing-in-run selected" entry — REPLACES that entry instead of pushing, so
+  // backing or forwarding out of the drill skips that empty state and lands
+  // straight on the pre-drill case (and one forward returns to this selection).
+  // Once we're on a run commit, further hops push, so ↑/↓ and back/forward still
+  // walk the run.
+  const selectInDrill = React.useCallback((id) => {
+    scrollModeRef.current = 'center';
+    setGroupSel(null);
+    const inRun = !!drillItem && drillItem.chunks.some((c) => c.id === currentId);
+    navigate(id, !inRun);
+  }, [navigate, drillItem, currentId]);
+  // Facet counts for the FilterBar. Hoisted to the top level (was inline in the
+  // JSX) because the FilterBar now lives in a conditionally-rendered branch —
+  // calling useMemo from inside that branch would break the Rules of Hooks.
+  const filterCounts = React.useMemo(() => facetCounts(chunks), [chunks]);
 
-  // Filter-scoped keyboard transport. With a filter active, ↑/← step to the
-  // previous *matching* commit and ↓/→ to the next, so arrowing the timeline
-  // never lands on a commit the filter has hidden between two visible ones. We
-  // claim the key in the capture phase and stopPropagation so the data store's
-  // global arrow handler — which walks the unfiltered chunk stream — doesn't also
-  // fire. With no filter active we don't claim the key: the global handler
-  // already walks every commit, which is the same set. Skipped in text fields /
-  // with a modifier held, mirroring both other handlers.
+  // Keyboard transport for the left rail. We claim ↑/←/↓/→ in the capture phase
+  // and stopPropagation so the data store's global arrow handler — which walks
+  // the raw, unfiltered chunk stream — doesn't also fire, whenever the displayed
+  // order differs from that stream:
+  //   • a filter is narrowing the list (step matching commits only),
+  //   • data-op runs are merged (jump OVER a "many data file modifications" cell
+  //     rather than stepping through each hidden data write), or
+  //   • we're inside the data drill (walk that focused subset).
+  // Otherwise we don't claim the key — the global handler already walks every
+  // commit, the same set. Skipped in text fields / with a modifier held.
+  const navOverride = filterActive || mergeDataOps || !!drillItem;
   React.useEffect(() => {
-    if (!filterActive) return undefined;
+    if (!navOverride) return undefined;
     const onKey = (e) => {
       if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
       const t = e.target;
@@ -248,17 +315,30 @@ export function WireDossierInbox() {
       if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') dir = -1;
       else if (e.key === 'ArrowDown' || e.key === 'ArrowRight') dir = 1;
       else return;
-      if (filteredRows.length === 0) return;
+      // Inside the drill, walk that run's own commits; otherwise the filtered
+      // list, hopping over any commit folded into a merge cell.
+      const list = drillItem ? drillItem.chunks : filteredRows;
+      const skip = drillItem ? null : mergedIds;
+      if (list.length === 0) return;
       e.preventDefault();
       e.stopPropagation();
-      const idx = currentId ? filteredRows.findIndex((c) => c.id === currentId) : -1;
-      const base = idx < 0 ? (dir > 0 ? -1 : 0) : idx;
-      const next = Math.max(0, Math.min(filteredRows.length - 1, base + dir));
-      if (next !== idx) selectCommit(filteredRows[next].id);
+      const findNavigable = (from, step) => {
+        for (let i = from + step; i >= 0 && i < list.length; i += step) {
+          if (!skip || !skip.has(list[i].id)) return i;
+        }
+        return -1;
+      };
+      const idx = currentId ? list.findIndex((c) => c.id === currentId) : -1;
+      // No current selection → land on the first navigable row; otherwise step
+      // one navigable row in `dir`, skipping merged commits.
+      const next = idx < 0 ? findNavigable(-1, 1) : findNavigable(idx, dir);
+      // Inside the drill, route through selectInDrill so the first hop replaces
+      // the empty drill-open entry (back/forward skip it) just like a click does.
+      if (next >= 0 && next !== idx) (drillItem ? selectInDrill : selectCommit)(list[next].id);
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [filterActive, filteredRows, currentId, selectCommit]);
+  }, [navOverride, drillItem, filteredRows, mergedIds, currentId, selectCommit, selectInDrill]);
 
   const sel = currentId ? byId[currentId] : chunks[0];
 
@@ -311,7 +391,20 @@ export function WireDossierInbox() {
       ro.observe(el);
     }
     return () => { window.removeEventListener('resize', onResize); ro?.disconnect(); };
-  }, [measureRows, currentId, displayItems, groupSel]);
+    // `drillItem` is a dep so leaving the drill remounts the main list and this
+    // re-attaches the ResizeObserver / re-measures against the restored content.
+  }, [measureRows, currentId, displayItems, groupSel, drillItem]);
+
+  // Restore the main list's scroll position when the full timeline remounts
+  // after a drill-out. currentId hasn't changed across the collapse/reopen
+  // (back/forward included — the drill rides its own nav axis), so the re-center
+  // effect never fires here — this is the only thing touching scroll, and it
+  // lands the auditor back where they clicked in.
+  React.useLayoutEffect(() => {
+    if (!drillItem && listRef.current) {
+      listRef.current.scrollTop = savedListScrollRef.current;
+    }
+  }, [drillItem]);
 
   // The open commit's bar reads from the same measured map as the ticks.
   const currentFrac = rowFracs && sel ? rowFracs.get(sel.id) ?? null : null;
@@ -323,6 +416,25 @@ export function WireDossierInbox() {
       rightSlot={<TopBarControls />}
     >
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+        {/* Left rail: the full timeline normally, or — while a merged data run is
+            drilled in — a thin reopen bar plus a focused sub-timeline for that
+            run. The center/right panes below are rendered off groupSel/sel, which
+            this swap never touches, so the open dossier survives the toggle. */}
+        {drillItem ? (
+          <>
+            <CollapsedPrimaryBar onReopen={closeDataDrill} />
+            <DataDrillPane
+              width={paneWidths.inboxList}
+              drill={drillItem}
+              sel={sel}
+              groupSel={groupSel}
+              onSelectCommit={selectInDrill}
+              onSelectGroup={openGroupFromList}
+              checkout={checkout}
+              selectedInput={selectedInput}
+            />
+          </>
+        ) : (
         <div style={{ width: paneWidths.inboxList, flexShrink: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
           <FilterBar
             kindSel={kindSel}
@@ -334,10 +446,16 @@ export function WireDossierInbox() {
             toggleFlagTok={toggleFlagTok}
             toggleClass={toggleClass}
             resetFilters={resetFilters}
-            counts={React.useMemo(() => facetCounts(chunks), [chunks])}
+            counts={filterCounts}
           />
           <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
-            <div ref={listRef} style={{ flex: 1, overflow: 'auto' }}>
+            {/* Track scroll live so a drill entered/left by ANY path (click or
+                back/forward) restores to where the auditor last was. */}
+            <div
+              ref={listRef}
+              onScroll={(e) => { savedListScrollRef.current = e.currentTarget.scrollTop; }}
+              style={{ flex: 1, overflow: 'auto' }}
+            >
               <div ref={contentRef}>
               {displayItems.map((item) =>
                 item.type === 'group' ? (
@@ -348,8 +466,14 @@ export function WireDossierInbox() {
                     currentCommitId={!groupSel && sel ? sel.id : null}
                     currentRowRef={currentRowRef}
                     checkout={checkout}
-                    onSelectGroup={() => { setGroupSel(item.group); recordFocus(`group:${item.group.id}`); }}
+                    onSelectGroup={() => openGroupFromList(item.group)}
                     onSelectCommit={selectFromList}
+                  />
+                ) : item.type === 'dataMerge' ? (
+                  <DataMergeRow
+                    key={item.key}
+                    item={item}
+                    onOpen={() => drillIntoData(item)}
                   />
                 ) : (
                   <CommitRow
@@ -384,6 +508,7 @@ export function WireDossierInbox() {
             />
           </div>
         </div>
+        )}
 
         <PaneResizer
           width={paneWidths.inboxList}
@@ -579,16 +704,17 @@ function FilterBar({ kindSel, flagSel, classSel, fileFilter, setFileFilter, togg
   );
 }
 
-// Marker color for a row in the scroll gutter, by descending salience.
-// Suspect levels shade through the heat ramp; a deterministic pre-flag is a
-// muted neutral note (not an alarm); an auditor's own flag is ink. Everything
-// else is unmarked.
+// Marker color for a row in the scroll gutter. The auditor's own flag wins
+// outright — a vivid blue tick — so anything the auditor marked stays visible
+// regardless of what the AI or the deterministic pass thought. Below that,
+// suspect levels shade through the red heat ramp, and a deterministic pre-flag
+// is a muted grey note (not an alarm). Everything else is unmarked.
 function gutterMark(r) {
+  if (r.userFlagged) return WF.userflagRail;
   if (r.flagLevel === 'high') return WF.heat4;
   if (r.flagLevel === 'medium') return WF.heat3;
   if (r.flagLevel === 'low' || r.flagLevel === 'mild') return WF.heat2;
   if (r.flag) return WF.ink3;
-  if (r.userFlagged) return WF.ink;
   return null;
 }
 
@@ -641,7 +767,7 @@ function ScrollHeatGutter({ rows, rowFracs, currentFrac, onSync, onPick }) {
               key={r.id}
               onClick={() => onPick(r.id)}
               title={`${r.kind.toLowerCase()} · ${r.sha ? r.sha.slice(0, 7) : '—'}${
-                r.flagLevel ? ' · ' + r.flagLevel + ' suspicion' : r.flag ? ' · pre-flagged' : r.userFlagged ? ' · your flag' : ''
+                r.userFlagged ? ' · your flag' : r.flagLevel ? ' · ' + r.flagLevel + ' suspicion' : r.flag ? ' · pre-flagged' : ''
               }`}
               style={{
                 position: 'absolute',
@@ -1049,10 +1175,107 @@ function buildDisplayItems(rows) {
   return items;
 }
 
+// ── Data-op stream merging (the `mergeDataOps` setting) ──────────────────────
+// When on, a long run of consecutive *data* display-items in the timeline —
+// data-class commits and groups whose every member is data — collapses into one
+// { type:'dataMerge' } cell ("many data file modifications (.log, .jsonl, …)").
+// Render-time only: the underlying chunks travel on the merge item so the cell
+// can drill into a focused sub-timeline (<DataDrillPane>) with the real rows.
+
+// A run merges once it spans at least this many display-items AND covers at
+// least this many underlying commits — so a lone all-data group (already one
+// clean cell) is left alone, and only genuine streams of writes collapse.
+const MIN_DATA_RUN_ITEMS = 2;
+const MIN_DATA_RUN_CHUNKS = 3;
+
+// A display-item is a "data op" for merging when it's a data-class commit or a
+// group that is entirely data (groupFileClass agrees with the per-commit class).
+function isDataItem(item) {
+  if (item.type === 'commit') return item.row.fileClass === 'data';
+  if (item.type === 'group') return groupFileClass(item.group.members) === 'data';
+  return false;
+}
+
+// Bare extension of a path ("jsonl"), lowercased; null when there's none.
+function extOf(path) {
+  if (!path) return null;
+  const base = path.split('/').pop();
+  const dot = base.lastIndexOf('.');
+  if (dot <= 0) return null;
+  return base.slice(dot + 1).toLowerCase();
+}
+
+// The distinct extensions a set of chunks touches, most-frequent first (ties
+// alphabetical) so the merge cell leads with the dominant artifact type. Reads
+// every coalesced path, not just the chunk's first file, so a coalesced
+// multi-file write contributes all its types.
+function collectExts(chunks) {
+  const freq = new Map();
+  for (const c of chunks) {
+    const paths = c.coalescedPaths && c.coalescedPaths.length ? c.coalescedPaths : [c.file];
+    for (const p of paths) {
+      const e = extOf(p);
+      if (e) freq.set(e, (freq.get(e) || 0) + 1);
+    }
+  }
+  return [...freq.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map((e) => e[0]);
+}
+
+// "data types: json, jsonl, txt, …" — the dominant-first type summary line on a
+// merge cell / drill header. Trails an ellipsis when more types are present than
+// shown.
+function formatDataTypes(exts) {
+  if (!exts.length) return 'data types: mixed';
+  const shown = exts.slice(0, 6);
+  const more = exts.length > shown.length;
+  return `data types: ${shown.join(', ')}${more ? ', …' : ''}`;
+}
+
+// First / last commit of a merged run and the count strictly between them, for
+// the "first … N between … last" span shown in place of a raw op count.
+function runSpan(chunks) {
+  return {
+    first: chunks[0],
+    last: chunks[chunks.length - 1],
+    between: Math.max(0, chunks.length - 2),
+  };
+}
+
+// Collapse qualifying runs of data display-items into single dataMerge items.
+// Walks the already-built item list; non-data items and short runs pass through
+// untouched. Each merge carries its source items (for the drill sub-timeline's
+// grouping), the flat chunk list, and the extension summary.
+function collapseDataRuns(items) {
+  const out = [];
+  let i = 0;
+  while (i < items.length) {
+    if (isDataItem(items[i])) {
+      let j = i + 1;
+      while (j < items.length && isDataItem(items[j])) j++;
+      const runItems = items.slice(i, j);
+      const chunks = runItems.flatMap((it) => (it.type === 'group' ? it.group.members : [it.row]));
+      if (runItems.length >= MIN_DATA_RUN_ITEMS && chunks.length >= MIN_DATA_RUN_CHUNKS) {
+        out.push({
+          type: 'dataMerge',
+          key: 'datamerge:' + runItems[0].key,
+          items: runItems,
+          chunks,
+          exts: collectExts(chunks),
+        });
+        i = j;
+        continue;
+      }
+    }
+    out.push(items[i]);
+    i++;
+  }
+  return out;
+}
+
 // How many member commits the collapsed group shows inline before the rest
 // fold into a single "… N more" ellipsis row. Click the ellipsis (or the
 // header) to open the group dossier — every commit + the full file tree.
-const MAX_INLINE_MEMBERS = 3;
+const MAX_INLINE_MEMBERS = 5;
 
 // Left-pane collapsed group: a regular-sized header naming the group, plus its
 // member commits as small, dimmed, indented sub-rows. Clicking the header
@@ -1226,6 +1449,218 @@ function GroupRow({ group, currentGroup, currentCommitId, currentRowRef, checkou
           </L>
         </div>
       )}
+    </div>
+  );
+}
+
+// ── Merged data-op cell + its drill-in sub-timeline ─────────────────────────
+// The single cell a collapsed data-op run renders as in the main timeline.
+// Clicking ANYWHERE on it opens the focused data sub-timeline (the parent
+// collapses the main list to a thin reopen bar); the open dossier is untouched.
+// Mirrors a collapsed group's shape — header + an indented preview of the first
+// few commits + a "… N more" line — but the preview rows are inert: the whole
+// cell is one click target, so individual commits aren't separately selectable
+// here (open the drill to select them). Groups inside the run are flattened for
+// the preview (item.chunks is already the flat commit list).
+function DataMergeRow({ item, onOpen }) {
+  const anon = useAnonymize();
+  const n = item.chunks.length;
+  const fc = FILECLASS_STYLE.data;
+  const shown = item.chunks.slice(0, MAX_INLINE_MEMBERS);
+  const moreCount = Math.max(0, n - MAX_INLINE_MEMBERS);
+  // Distinct change kinds in the run, in the canonical order, lowercased — the
+  // "operations:" summary row (e.g. create, modify, delete).
+  const present = new Set(item.chunks.map((c) => c.kind));
+  const ops = KIND_ORDER.filter((k) => present.has(k)).map((k) => k.toLowerCase());
+  return (
+    <div
+      onClick={onOpen}
+      title={`${n} consecutive data-file operations merged — click to open them in a focused timeline`}
+      style={{
+        borderBottom: `1px solid ${WF.rule}`,
+        background: WF.paperAlt,
+        boxShadow: `inset 3px 0 0 ${WF.rule2}`,
+        cursor: 'pointer',
+        userSelect: 'none',
+      }}
+    >
+      {/* Header: glyph, data badge, title, "N events grouped", then the data
+          types line — which sits above the indented commit preview below. */}
+      <div style={{ display: 'grid', gridTemplateColumns: '28px 28px 1fr auto', gap: 10, alignItems: 'start', padding: '10px 12px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', color: WF.ink3, fontFamily: WF.monoFont, fontSize: 14 }}>≡</div>
+        <div
+          style={{ width: 24, height: 24, background: fc.bg, border: `1.5px solid ${fc.fg}`, color: fc.fg, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 13 }}
+          title={fc.title}
+        >{fc.glyph}</div>
+        <div style={{ minWidth: 0 }}>
+          <L mono size={11} color={fc.fg} weight={700} style={{ display: 'block' }}>many data file modifications</L>
+          <L mono size={11} color={WF.ink2} style={{ display: 'block', marginTop: 3 }}>{n} events grouped</L>
+          <L
+            mono
+            size={10}
+            color={WF.ink3}
+            style={{ display: 'block', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+          >operations: {ops.join(', ')}</L>
+          <L
+            mono
+            size={10}
+            color={WF.ink3}
+            style={{ display: 'block', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+          >{formatDataTypes(item.exts)}</L>
+        </div>
+        <L mono size={10} color={WF.ink3}>open ▸</L>
+      </div>
+
+      {/* Indented preview of the first few commits — inert (clicks bubble to the
+          cell's onOpen). Indented to sit under the header title column. */}
+      {shown.map((c, i) => (
+        <div key={c.id || i} style={{ padding: '2px 12px 2px 76px', whiteSpace: 'nowrap', overflow: 'hidden' }}>
+          <L
+            size={11}
+            color={WF.ink3}
+            style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+          >{anon(c.title || c.file || '(untitled)')}</L>
+        </div>
+      ))}
+      {moreCount > 0 && (
+        <div style={{ padding: '3px 12px 8px 76px', whiteSpace: 'nowrap' }}>
+          <L size={11} color={WF.ink3} weight={600}>… {moreCount} more {moreCount === 1 ? 'commit' : 'commits'}</L>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The thin, full-height bar the main timeline collapses to while a data run is
+// drilled in. Clicking it discards the drill and restores the full list; the
+// open dossier is untouched either way.
+function CollapsedPrimaryBar({ onReopen }) {
+  return (
+    <div
+      onClick={onReopen}
+      title="reopen the full timeline"
+      style={{
+        width: 26,
+        flexShrink: 0,
+        cursor: 'pointer',
+        userSelect: 'none',
+        background: WF.paperAlt,
+        borderRight: `1px solid ${WF.rule}`,
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 12,
+        color: WF.ink2,
+      }}
+    >
+      <L mono size={12}>▸</L>
+      <L mono size={11} weight={700} style={{ writingMode: 'vertical-rl', textOrientation: 'mixed', letterSpacing: 1 }}>
+        full timeline
+      </L>
+      <L mono size={12}>▸</L>
+    </div>
+  );
+}
+
+// Header of the data sub-timeline — mirrors FilterBar's height/border so the
+// focused rail reads as a sibling of the main list, but names the merged run,
+// bookends it with first / last commit, and summarizes its types instead of
+// carrying filters.
+function DataDrillHeader({ drill }) {
+  const anon = useAnonymize();
+  const fc = FILECLASS_STYLE.data;
+  const { first, last, between } = runSpan(drill.chunks);
+  const firstName = anon(basename(first.file || first.title || '(untitled)'));
+  const lastName = anon(basename(last.file || last.title || '(untitled)'));
+  return (
+    <div style={{ padding: '10px 12px', borderBottom: inkBorder(), display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <L size={13} weight={700} color={fc.fg}>{fc.glyph} data operations</L>
+      <L
+        mono
+        size={10}
+        color={WF.ink3}
+        title={`${first.file || first.title || ''} → ${last.file || last.title || ''}`}
+        style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+      >{firstName} → {lastName} · {between} {between === 1 ? 'commit' : 'commits'} between</L>
+      <L mono size={10} color={WF.ink3} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        {formatDataTypes(drill.exts)} · ◀ reopen the full timeline on the left
+      </L>
+    </div>
+  );
+}
+
+// The focused sub-timeline a drilled data run shows in place of the main list:
+// the run's own chunks, regrouped and rendered with the same CommitRow /
+// GroupRow / heat gutter as the main rail. Selecting a member navigates exactly
+// as it would in the main list (it does NOT close the drill — only the reopen
+// bar does). Self-contained scroll/centering; the gutter rides an index spread
+// (no DOM measurement needed for a short focused list).
+function DataDrillPane({ width, drill, sel, groupSel, onSelectCommit, onSelectGroup, checkout, selectedInput }) {
+  const items = React.useMemo(() => buildDisplayItems(drill.chunks), [drill.chunks]);
+  const rows = drill.chunks;
+  const currentRowRef = React.useRef(null);
+  const selId = sel && sel.id;
+  const groupId = groupSel && groupSel.id;
+
+  // Center the open commit / group whenever navigation lands on one inside this
+  // run — including a back/forward step that reopens the drill on a different
+  // member (the run is a dep, so re-entering a drill re-centers too).
+  React.useEffect(() => {
+    const el = currentRowRef.current;
+    if (el) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }, [selId, groupId, items]);
+
+  const curId = !groupSel && sel ? sel.id : null;
+  const n = rows.length;
+  const curIdx = curId ? rows.findIndex((r) => r.id === curId) : -1;
+  const currentFrac = curIdx >= 0 ? (n <= 1 ? 0 : curIdx / (n - 1)) : null;
+
+  const scrollToCurrent = React.useCallback(() => {
+    const el = currentRowRef.current;
+    if (el) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }, []);
+
+  return (
+    <div style={{ width, flexShrink: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+      <DataDrillHeader drill={drill} />
+      <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+        <div style={{ flex: 1, overflow: 'auto' }}>
+          {items.map((item) =>
+            item.type === 'group' ? (
+              <GroupRow
+                key={item.key}
+                group={item.group}
+                currentGroup={groupSel && groupSel.id === item.group.id}
+                currentCommitId={!groupSel && sel ? sel.id : null}
+                currentRowRef={currentRowRef}
+                checkout={checkout}
+                onSelectGroup={() => onSelectGroup(item.group)}
+                onSelectCommit={onSelectCommit}
+              />
+            ) : (
+              <CommitRow
+                key={item.key}
+                row={item.row}
+                current={!groupSel && item.row.id === selId}
+                innerRef={!groupSel && item.row.id === selId ? currentRowRef : undefined}
+                checkedOut={checkout.lastSha && item.row.sha === checkout.lastSha}
+                pendingCheckout={checkout.pendingSha === item.row.sha}
+                onSelect={() => onSelectCommit(item.row.id)}
+                onHoldComplete={() => { onSelectCommit(item.row.id); checkout.checkout(item.row.sha, selectedInput); }}
+                checkoutEnabled={checkout.enabled}
+              />
+            )
+          )}
+        </div>
+        <ScrollHeatGutter
+          rows={rows}
+          rowFracs={null}
+          currentFrac={currentFrac}
+          onSync={scrollToCurrent}
+          onPick={onSelectCommit}
+        />
+      </div>
     </div>
   );
 }

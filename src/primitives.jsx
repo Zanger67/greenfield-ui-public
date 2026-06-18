@@ -34,6 +34,9 @@ export const WF = {
   // The auditor's own "user flagged" accent — orange, distinct from the red
   // AI-suspicion heat and the neutral ink chips.
   userflag: 'var(--wf-userflag)',
+  // The user-flag tick in the dossier scroll heat-gutter — a vivid blue, kept
+  // separate from `userflag` (orange) so the thin rail mark reads as blue there.
+  userflagRail: 'var(--wf-userflag-rail)',
   // Foreground green for "+adds" diff counts (dels reuse `heat4`).
   add: 'var(--wf-add)',
   // Faint warm highlight behind an active suspicion item.
@@ -174,10 +177,23 @@ const mdCodeStyle = {
   border: `1px solid ${WF.rule}`,
   borderRadius: 3,
   padding: '0 3px',
-  // Preserve internal spacing of a code span even when the surrounding block
-  // collapses whitespace (the block Markdown paragraphs use white-space: normal
-  // for CommonMark soft-break behaviour — see MdBlock).
+  // A code span wraps in three tiers, cheapest first:
+  //   1. The whole span is ONE atomic word. As an inline-block the surrounding
+  //      line-breaker can't split it mid-span — when it doesn't fit in the space
+  //      left on the line it moves, intact, onto a fresh line.
+  //   2. Only once the span is wider than a full line does it wrap internally,
+  //      first at its OWN spaces (whiteSpace: pre-wrap, which also preserves the
+  //      code's internal spacing — block Markdown paragraphs use white-space:
+  //      normal for CommonMark soft-breaks, see MdBlock).
+  //   3. Only if a space-delimited segment is STILL wider than the line does it
+  //      break inside that segment (overflowWrap: break-word) — e.g. a long path
+  //      or identifier with no spaces.
+  // maxWidth caps the box at the container so tiers 2/3 can engage instead of the
+  // span running past the box.
+  display: 'inline-block',
+  maxWidth: '100%',
   whiteSpace: 'pre-wrap',
+  overflowWrap: 'break-word',
 };
 
 // Fenced (```) block inside the inline flow. Rendered as a `display: block`

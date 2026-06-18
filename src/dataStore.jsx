@@ -340,6 +340,53 @@ export function withSuspicionGate(data, show) {
   };
 }
 
+// Strip the deterministic chunker pre-flags off one chunk — the inverse of the
+// preFlag handling in buildDataset, for the flags-off case. Nulls `flag`/`flags`
+// and recomputes the synthetic salience fields as if flags.jsonl carried nothing
+// for this commit. The AI suspicion layer (`flagLevel` + per-agent suspicions)
+// and the auditor's own markups (userFlagged / visited / notes) are preserved:
+// the gate is specifically the *deterministic* pre-flag layer, nothing else.
+// Composes with stripChunkSuspicion in either order — each recomputes the shared
+// salience fields (suspicion / h / flagged) from the *other* layer's current
+// state, so applying both gates lands on the clean (userFlagged-only) result.
+function stripChunkPreFlags(c) {
+  return {
+    ...c,
+    flag: null,
+    flags: [],
+    suspicion: c.flagLevel ? 1 : 0,         // mirrors buildDataset with preFlag absent
+    h: FLAG_LEVEL_HEAT[c.flagLevel] || 0,   // mirrors heatBucket with preFlag absent
+    flagged: !!c.flagLevel || !!c.userFlagged,
+  };
+}
+
+// Neutralize the deterministic pre-flag layer (the chunker's flags.jsonl
+// anomalies — add_then_remove, run_scrapped, …) across a whole dataset when the
+// auditor has it switched off (the default). These are heuristic notes, not
+// verdicts, so a fresh read isn't peppered with them until asked for. Returns
+// `data` untouched when `show` is true. When off it rebuilds chunks/byId/bySha
+// from the stripped chunks (so even deep sha→chunk consumers see no pre-flag) and
+// recomputes the coverage suspicion totals from them. Applied alongside
+// withSuspicionGate at the data source (DataProvider) — one gate, no per-screen
+// leaks; the ungated data stays exposed as `rawData` for the export deliverable,
+// which must remain complete regardless of this view toggle.
+export function withDeterministicFlagGate(data, show) {
+  if (show || !data || !data.chunks) return data;
+  const chunks = data.chunks.map(stripChunkPreFlags);
+  const byId = Object.fromEntries(chunks.map((c) => [c.id, c]));
+  const bySha = {};
+  for (const c of chunks) { if (c.sha && !(c.sha in bySha)) bySha[c.sha] = c; }
+  const susTotal = chunks.reduce((s, c) => s + (c.suspicion || 0), 0);
+  const susSeen = chunks.filter((c) => c.visited).reduce((s, c) => s + (c.suspicion || 0), 0);
+  return {
+    ...data,
+    chunks,
+    byId,
+    bySha,
+    coverage: { ...data.coverage, susSeen, susTotal },
+  };
+}
+
 // Resolve a possibly-abbreviated commit SHA to its full 40-char form. The
 // commit builder normally emits full SHAs, but some artifacts (thread
 // annotations / semantic_threads) abbreviate to 7 chars; those must still
@@ -720,6 +767,11 @@ export function DataProvider({ children }) {
   // "area:<id>") so a commit's thread link can deep-link into that thread. Part
   // of the nav tuple alongside screen/id; the areas screen applies it once.
   const [areaFocus, setAreaFocus] = React.useState(null);
+  // The dossier's data-merge drill: the key of the merged data run currently
+  // expanded into the focused sub-timeline, or null. A separate nav-tuple axis
+  // from `areaFocus` (a group can be selected in the center while the drill is
+  // open), so opening/closing the data pane is a real back/forward step.
+  const [dataDrill, setDataDrillState] = React.useState(null);
   const [visitedOverlay, setVisitedOverlay] = React.useState({});  // id → true
   const [flaggedOverlay, setFlaggedOverlay] = React.useState({});  // id → true (user-added flag)
   const [userNotesOverlay, setUserNotesOverlay] = React.useState({}); // id → UserNote[]
@@ -728,10 +780,11 @@ export function DataProvider({ children }) {
   const [groupTagsOverlay, setGroupTagsOverlay] = React.useState({});   // targetKey → [groupId]
   const userNoteSeq = React.useRef(0);
   const userGroupSeq = React.useRef(0);
-  // The AI-suspicion gate (default off). Read here — DataProvider renders inside
-  // SettingsProvider (see App.jsx) — so the suspicion layer can be neutralized
-  // once, at the source, for every consumer. See withSuspicionGate.
-  const { showAiSuspicion } = useSettings();
+  // The AI-suspicion gate and the deterministic pre-flag gate (both default
+  // off). Read here — DataProvider renders inside SettingsProvider (see App.jsx)
+  // — so each layer can be neutralized once, at the source, for every consumer.
+  // See withSuspicionGate / withDeterministicFlagGate.
+  const { showAiSuspicion, showDeterministicFlags } = useSettings();
 
   // Manifest discovery.
   React.useEffect(() => {
@@ -765,7 +818,7 @@ export function DataProvider({ children }) {
         const saved = window.history.state;
         const remembered = loadLastInput();
         if (saved?.input && normalised.some((n) => n.name === saved.input)) {
-          pendingNav.current = { screen: saved.screen ?? 'dossier', id: saved.id ?? null, focus: saved.focus ?? null };
+          pendingNav.current = { screen: saved.screen ?? 'dossier', id: saved.id ?? null, focus: saved.focus ?? null, dataDrill: saved.dataDrill ?? null };
           setSelectedInput(saved.input);
         } else if (remembered && normalised.some((n) => n.name === remembered)) {
           setSelectedInput(remembered);
@@ -774,7 +827,7 @@ export function DataProvider({ children }) {
           // Land on the help/readme screen so a fresh auditor reads the mental
           // model first; once any trace has loaded, last-input is set and later
           // opens go straight to the trace.
-          if (!remembered) pendingNav.current = { screen: 'help', id: null, focus: null };
+          if (!remembered) pendingNav.current = { screen: 'help', id: null, focus: null, dataDrill: null };
           setSelectedInput(normalised[normalised.length - 1].name);
         }
       })
@@ -794,15 +847,16 @@ export function DataProvider({ children }) {
     // through here, so this is the one place to remember the active trace for a
     // future reopen.
     saveLastInput(selectedInput);
-    const target = pendingNav.current || { screen: 'dossier', id: null, focus: null };
+    const target = pendingNav.current || { screen: 'dossier', id: null, focus: null, dataDrill: null };
     pendingNav.current = null;
     setState({ status: 'loading', error: null, data: null });
     setCurrentId(target.id);
     setScreen(target.screen);
     setAreaFocus(target.focus ?? null);
+    setDataDrillState(target.dataDrill ?? null);
     // Record the live tuple on the current history entry so a reload (state
     // persists across reloads) or a back-step lands exactly here.
-    window.history.replaceState({ input: selectedInput, screen: target.screen, id: target.id, focus: target.focus ?? null }, '');
+    window.history.replaceState({ input: selectedInput, screen: target.screen, id: target.id, focus: target.focus ?? null, dataDrill: target.dataDrill ?? null }, '');
     // Markups are per-trace and persisted — load this trace's, then fold in
     // the just-visited commit from the restored position.
     const stored = loadStoredOverlays(selectedInput);
@@ -943,14 +997,16 @@ export function DataProvider({ children }) {
   currentIdRef.current = currentId;
   const focusRef = React.useRef(areaFocus);
   focusRef.current = areaFocus;
+  const dataDrillRef = React.useRef(dataDrill);
+  dataDrillRef.current = dataDrill;
   const pendingNav = React.useRef(null);
 
   // Apply a tuple to live state. Shared by the history-pushing actions and by
   // popstate — the latter must not push, so pushing lives in pushNav only. A
   // cross-trace tuple defers screen/id to the load effect via pendingNav.
-  const applyNav = React.useCallback(({ input, screen: s, id, focus }) => {
+  const applyNav = React.useCallback(({ input, screen: s, id, focus, dataDrill: drill }) => {
     if (input !== undefined && input !== inputRef.current) {
-      pendingNav.current = { screen: s ?? 'dossier', id: id ?? null, focus: focus ?? null };
+      pendingNav.current = { screen: s ?? 'dossier', id: id ?? null, focus: focus ?? null, dataDrill: drill ?? null };
       setSelectedInput(input);
       return;
     }
@@ -960,21 +1016,27 @@ export function DataProvider({ children }) {
       if (id != null) visitChunk(id);
     }
     if (focus !== undefined) setAreaFocus(focus);
+    if (drill !== undefined) setDataDrillState(drill);
   }, [visitChunk]);
 
   // Push one entry for the next tuple, collapsing no-op repeats (e.g.
   // re-clicking the already-selected commit on the same screen/trace).
-  const pushNav = React.useCallback((input, s, id, focus) => {
+  // The 5th arg (the data-drill key) defaults to the current drill, so the many
+  // existing 4-arg callers carry it forward untouched — only the dedicated
+  // open/close-drill actions move that axis.
+  const pushNav = React.useCallback((input, s, id, focus, dataDrill = dataDrillRef.current) => {
     if (input === inputRef.current && s === screenRef.current
-      && id === currentIdRef.current && focus === focusRef.current) return;
+      && id === currentIdRef.current && focus === focusRef.current
+      && dataDrill === dataDrillRef.current) return;
     // One chokepoint for every user-initiated navigation — tab/page switch,
-    // commit selection, deep-link, trace swap. The from/to tuples let a reader
-    // tell which axis changed (screen → tab, id → commit, input → trace).
+    // commit selection, deep-link, trace swap, data-pane open/close. The
+    // from/to tuples let a reader tell which axis changed (screen → tab,
+    // id → commit, input → trace, dataDrill → data pane).
     logActivity('nav', {
-      from: { input: inputRef.current, screen: screenRef.current, id: currentIdRef.current, focus: focusRef.current },
-      to: { input, screen: s, id, focus },
+      from: { input: inputRef.current, screen: screenRef.current, id: currentIdRef.current, focus: focusRef.current, dataDrill: dataDrillRef.current },
+      to: { input, screen: s, id, focus, dataDrill },
     });
-    window.history.pushState({ input, screen: s, id, focus }, '');
+    window.history.pushState({ input, screen: s, id, focus, dataDrill }, '');
   }, []);
 
   // Record the in-screen selection (a rail item on the areas screen, the group
@@ -990,16 +1052,46 @@ export function DataProvider({ children }) {
     if (next === focusRef.current) return;
     setAreaFocus(next);
     window.history.replaceState(
-      { input: inputRef.current, screen: screenRef.current, id: currentIdRef.current, focus: next },
+      { input: inputRef.current, screen: screenRef.current, id: currentIdRef.current, focus: next, dataDrill: dataDrillRef.current },
       '',
     );
   }, []);
+
+  // Open / close the dossier's data-merge drill as its own back/forward step, so
+  // the browser history (and reload) walk in and out of the focused data pane
+  // like any other navigation. Only the drill axis moves — id/focus/screen ride
+  // along unchanged (defaulted in pushNav), so the open dossier in the center is
+  // untouched. The dossier screen resolves `key` to the live merged run.
+  const openDataDrill = React.useCallback((key) => {
+    if (key == null || key === dataDrillRef.current) return;
+    pushNav(inputRef.current, screenRef.current, currentIdRef.current, focusRef.current, key);
+    applyNav({ dataDrill: key });
+  }, [pushNav, applyNav]);
+  const closeDataDrill = React.useCallback(() => {
+    if (dataDrillRef.current == null) return;
+    pushNav(inputRef.current, screenRef.current, currentIdRef.current, focusRef.current, null);
+    applyNav({ dataDrill: null });
+  }, [pushNav, applyNav]);
 
   // The areas-screen focus is a one-shot set only by openThread; every other
   // nav clears it (passes null), so e.g. clicking the "areas" tab later lands on
   // the default selection rather than a stale deep-linked thread. Back/forward
   // still restore whatever focus the visited history entry recorded.
-  const navigate = React.useCallback((id) => {
+  // `replace` coalesces the selection into the CURRENT history entry instead of
+  // pushing a back-step. The dossier uses it for the first hop into a data-drill
+  // run, so the "drill open, nothing-in-run selected" entry is overwritten rather
+  // than left behind — back/forward then skip that empty state and land straight
+  // on the pre-drill case / the first real selection. The drill axis is carried
+  // through unchanged either way.
+  const navigate = React.useCallback((id, replace = false) => {
+    if (replace) {
+      window.history.replaceState(
+        { input: inputRef.current, screen: screenRef.current, id, focus: null, dataDrill: dataDrillRef.current },
+        '',
+      );
+      applyNav({ id, focus: null });
+      return;
+    }
     pushNav(inputRef.current, screenRef.current, id, null);
     applyNav({ id, focus: null });
   }, [pushNav, applyNav]);
@@ -1066,7 +1158,7 @@ export function DataProvider({ children }) {
   // commit/screen we left it on (preserved in the entry below).
   const selectInput = React.useCallback((name) => {
     if (!name || name === inputRef.current) return;
-    pushNav(name, 'dossier', null, null);
+    pushNav(name, 'dossier', null, null, null);
     setSelectedInput(name);
   }, [pushNav]);
 
@@ -1076,8 +1168,8 @@ export function DataProvider({ children }) {
   React.useEffect(() => {
     const onPop = (e) => {
       const st = e.state;
-      if (st) applyNav({ input: st.input, screen: st.screen ?? 'dossier', id: st.id ?? null, focus: st.focus ?? null });
-      else applyNav({ screen: 'dossier', id: null, focus: null });
+      if (st) applyNav({ input: st.input, screen: st.screen ?? 'dossier', id: st.id ?? null, focus: st.focus ?? null, dataDrill: st.dataDrill ?? null });
+      else applyNav({ screen: 'dossier', id: null, focus: null, dataDrill: null });
     };
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
@@ -1293,7 +1385,11 @@ export function DataProvider({ children }) {
   //     global, and other traces load their (now-cleared) markups on next select;
   //   * the live in-memory overlays for the current trace;
   //   * the navigation position — back to the help/readme screen with no commit
-  //     selected, so a reset mirrors a genuine fresh open (which lands on help).
+  //     selected, so a reset mirrors a genuine fresh open (which lands on help);
+  //   * the display settings (back to defaults) and every trace's session timer
+  //     (back to a fresh 30:00) — both live in their own always-mounted providers
+  //     (SettingsProvider / SessionTimer), so we broadcast a `redlogs:reset-cache`
+  //     window event they each listen for and clear their own state + storage.
   // The browser's back/forward *stack* can't be purged programmatically, so we
   // replaceState a fresh default tuple onto the current entry; older entries
   // remain reachable but restore into the now-empty markups.
@@ -1322,11 +1418,14 @@ export function DataProvider({ children }) {
     setScreen('help');
     setAreaFocus(null);
     window.history.replaceState({ input: inputRef.current, screen: 'help', id: null, focus: null }, '');
+    // Settings + the per-trace timers own their state in separate providers;
+    // tell them to reset themselves to defaults too.
+    window.dispatchEvent(new Event('redlogs:reset-cache'));
     logActivity('reset-cache', {});
   }, []);
 
   const value = React.useMemo(() => {
-    const actions = { navigate, goScreen, openCommit, openThread, openArea, openUserGroup, openGroup, openDoc, recordFocus, toggleFlag, toggleDismiss, setDismissed, addUserNote, updateUserNote, deleteUserNote, createUserGroup, renameUserGroup, deleteUserGroup, tagTarget, untagTarget, selectInput, resetCache };
+    const actions = { navigate, goScreen, openCommit, openThread, openArea, openUserGroup, openGroup, openDoc, recordFocus, openDataDrill, closeDataDrill, toggleFlag, toggleDismiss, setDismissed, addUserNote, updateUserNote, deleteUserNote, createUserGroup, renameUserGroup, deleteUserGroup, tagTarget, untagTarget, selectInput, resetCache };
     // Raw markup overlays, exposed so non-chunk targets (semantic areas /
     // threads, keyed by their own ids) can read their notes/flags/dismissals by
     // key — chunks fold theirs into the derived chunk objects below instead.
@@ -1335,7 +1434,7 @@ export function DataProvider({ children }) {
     // The selected trace's manifest entry ({ name, label, source }) — handoff
     // prompts read it to name the trace + where its files live (see traceLocation).
     const currentTrace = inputs.find((i) => i.name === selectedInput) || null;
-    const baseFields = { inputs, selectedInput, currentTrace, currentId, screen, areaFocus, userNotesOverlay, flaggedOverlay, dismissedOverlay, userGroupsOverlay, groupTagsOverlay, showAiSuspicion, ...actions };
+    const baseFields = { inputs, selectedInput, currentTrace, currentId, screen, areaFocus, dataDrill, userNotesOverlay, flaggedOverlay, dismissedOverlay, userGroupsOverlay, groupTagsOverlay, showAiSuspicion, showDeterministicFlags, ...actions };
     if (state.status !== 'ready') return { ...state, ...baseFields };
     const data = state.data;
     const chunks = data.chunks.map((c) => {
@@ -1365,11 +1464,11 @@ export function DataProvider({ children }) {
     return {
       status: 'ready',
       error: null,
-      data: withSuspicionGate(fullData, showAiSuspicion),
+      data: withDeterministicFlagGate(withSuspicionGate(fullData, showAiSuspicion), showDeterministicFlags),
       rawData: fullData,
       ...baseFields,
     };
-  }, [state, inputs, selectedInput, currentId, screen, areaFocus, showAiSuspicion, visitedOverlay, flaggedOverlay, userNotesOverlay, dismissedOverlay, userGroupsOverlay, groupTagsOverlay, navigate, goScreen, openCommit, openThread, openArea, openUserGroup, openGroup, openDoc, recordFocus, selectInput, toggleFlag, toggleDismiss, setDismissed, addUserNote, updateUserNote, deleteUserNote, createUserGroup, renameUserGroup, deleteUserGroup, tagTarget, untagTarget, resetCache]);
+  }, [state, inputs, selectedInput, currentId, screen, areaFocus, dataDrill, showAiSuspicion, showDeterministicFlags, visitedOverlay, flaggedOverlay, userNotesOverlay, dismissedOverlay, userGroupsOverlay, groupTagsOverlay, navigate, goScreen, openCommit, openThread, openArea, openUserGroup, openGroup, openDoc, recordFocus, openDataDrill, closeDataDrill, selectInput, toggleFlag, toggleDismiss, setDismissed, addUserNote, updateUserNote, deleteUserNote, createUserGroup, renameUserGroup, deleteUserGroup, tagTarget, untagTarget, resetCache]);
 
   return <DataContext.Provider value={value}>{children}</DataContext.Provider>;
 }

@@ -76,6 +76,16 @@ const DEFAULTS = {
   // data store neutralizes the exposed data at the source when this is off —
   // see withSuspicionGate in dataStore.jsx.
   showAiSuspicion: false,
+  // The deterministic pre-flag layer — the chunker's flags.jsonl anomalies
+  // (`add_then_remove`, `run_scrapped`, …) surfaced as the muted "ⓘ note" chips,
+  // gutter marks, the group pre-flag rollups, and their share of the suspect
+  // filter facet. These are heuristic notes, not verdicts, so like the AI layer
+  // they default OFF — a fresh read of the trace isn't pre-seeded with the
+  // chunker's guesses; flip it on to let them surface. Unlike AI suspicion this
+  // is a quieter, lower-stakes layer, so its toggle lives in the gear popover
+  // rather than the top bar. The data store neutralizes the pre-flags at the
+  // source when off — see withDeterministicFlagGate in dataStore.jsx.
+  showDeterministicFlags: false,
   inboxSubline: 'none',
   inboxTitleFromShortTitle: true,
   // The "adding a tag flags this <noun>" helper line under each tag editor.
@@ -83,6 +93,16 @@ const DEFAULTS = {
   // an item also flags it, the reminder is just clutter on every dossier — so
   // it defaults OFF. Flip it on from the gear popover. See <TagFlagsHint>.
   showTagFlagsHint: false,
+  // Merge long runs of consecutive data-file operations (data-class commits and
+  // all-data groups) in the dossier timeline into a single "many data file
+  // modifications" cell, tagged with the extensions it covers. Defaults OFF —
+  // the full per-commit stream is the baseline; flip it on when a trace's data
+  // writes (logs, jsonl dumps, checkpoints) bury the source edits. Clicking a
+  // merged cell collapses the main timeline to a thin reopen bar and opens a
+  // focused sub-timeline scoped to just that run (see <DataMergeRow> /
+  // <DataDrillPane> in WireDossierInbox). Purely a render-time grouping —
+  // navigation, filters, and the export still operate on the underlying commits.
+  mergeDataOps: false,
   // "Anonymous mode" — a privacy screen for screenshots / screen-shares / external
   // demos. When ON, every piece of on-screen text DERIVED FROM THE TRACE (code,
   // diffs, commands, agent/narrator annotations, commit messages, file paths,
@@ -141,6 +161,30 @@ export function SettingsProvider({ children }) {
     document.documentElement.dataset.theme = settings.darkMode ? 'dark' : 'light';
   }, [settings.darkMode]);
 
+  // Pane-width writes are debounced (see setPaneWidth below); this ref holds the
+  // pending trailing-edge write. Declared up here so the reset handler can cancel
+  // it — a drag landed just before "reset cache" would otherwise fire its delayed
+  // write ~200ms *after* the reset and re-persist the old margins, resurrecting
+  // them on the next reload.
+  const persistTimer = React.useRef(null);
+
+  // "Reset cache" (in the gear popover) wipes the auditor's whole session, which
+  // includes every display preference. The data store broadcasts this event;
+  // we restore DEFAULTS in-memory and in storage. paneWidths gets its own fresh
+  // object so we never hand out the shared PANE_DEFAULTS reference.
+  React.useEffect(() => {
+    const onReset = () => {
+      // Kill any in-flight debounced pane-width write so it can't clobber the
+      // freshly-reset margins after we land defaults.
+      if (persistTimer.current) { clearTimeout(persistTimer.current); persistTimer.current = null; }
+      const fresh = { ...DEFAULTS, paneWidths: { ...PANE_DEFAULTS } };
+      try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(fresh)); } catch { /* quota / disabled storage */ }
+      setSettings(fresh);
+    };
+    window.addEventListener('redlogs:reset-cache', onReset);
+    return () => window.removeEventListener('redlogs:reset-cache', onReset);
+  }, []);
+
   const setSetting = React.useCallback((key, value) => {
     setSettings((prev) => {
       const next = { ...prev, [key]: value };
@@ -156,7 +200,7 @@ export function SettingsProvider({ children }) {
   // Pane widths change on every pointermove of a drag, so update React state
   // immediately (smooth resize) but coalesce the localStorage write to the
   // trailing edge — no need to hit storage a few hundred times per drag.
-  const persistTimer = React.useRef(null);
+  // (persistTimer is declared above so the reset handler can cancel it.)
   const setPaneWidth = React.useCallback((key, value) => {
     setSettings((prev) => {
       const next = { ...prev, paneWidths: { ...prev.paneWidths, [key]: value } };
@@ -242,7 +286,7 @@ export function TagFlagsHint({ noun, style }) {
 // Lives at the far right of the top bar. A small unobtrusive gear; clicking it
 // drops a popover with the available toggles. Closes on outside-click / Escape.
 export function SettingsButton() {
-  const { showTimestamps, showCommitHashes, showLineNumbers, showAuditEventBox, inboxSubline, inboxTitleFromShortTitle, showTagFlagsHint, anonymize, setSetting } = useSettings();
+  const { showTimestamps, showCommitHashes, showLineNumbers, showAuditEventBox, showDeterministicFlags, inboxSubline, inboxTitleFromShortTitle, showTagFlagsHint, mergeDataOps, anonymize, setSetting } = useSettings();
   const [open, setOpen] = React.useState(false);
   const wrapRef = React.useRef(null);
 
@@ -328,6 +372,14 @@ export function SettingsButton() {
             />
           </div>
           <div style={{ marginTop: 12 }}>
+            <ToggleRow
+              label="show deterministic flags"
+              hint="chunker pre-flags (add-then-remove, run-scrapped)"
+              checked={showDeterministicFlags}
+              onChange={(v) => setSetting('showDeterministicFlags', v)}
+            />
+          </div>
+          <div style={{ marginTop: 12 }}>
             <SelectRow
               label="inbox subline"
               hint="greyed line under each row"
@@ -342,6 +394,14 @@ export function SettingsButton() {
               hint="use the annotation headline as the row title when present"
               checked={inboxTitleFromShortTitle}
               onChange={(v) => setSetting('inboxTitleFromShortTitle', v)}
+            />
+          </div>
+          <div style={{ marginTop: 12 }}>
+            <ToggleRow
+              label="merge data-op streams"
+              hint='collapse long runs of data writes into one "many data file modifications" cell'
+              checked={mergeDataOps}
+              onChange={(v) => setSetting('mergeDataOps', v)}
             />
           </div>
           <div style={{ marginTop: 12 }}>
@@ -516,10 +576,11 @@ export function TopBarControls() {
 }
 
 // "Reset cache" — clears the auditor's accumulated session state: visited
-// marks, user flags, notes (across all traces, in localStorage), and the live
-// navigation position. Two-step (click → confirm) so an errant click can't wipe
-// a session's markups. Lives in its own settings section because it acts on the
-// trace store, not a display preference.
+// marks, user flags, notes (across all traces, in localStorage), the live
+// navigation position, the display settings (back to defaults), and every
+// trace's session timer (back to a fresh 30:00). Two-step (click → confirm) so
+// an errant click can't wipe a session's markups. Lives in its own settings
+// section because it acts on the whole session, not one display preference.
 function ResetCacheRow({ onDone }) {
   const { resetCache } = useData();
   const [armed, setArmed] = React.useState(false);
@@ -534,7 +595,7 @@ function ResetCacheRow({ onDone }) {
       <span style={{ flex: 1, minWidth: 0 }}>
         <L size={13} style={{ display: 'block' }}>reset cache</L>
         <L mono size={10} color={WF.ink3} style={{ display: 'block', marginTop: 1 }}>
-          visited · flags · notes · history
+          visited · flags · notes · history · settings · timer
         </L>
       </span>
       {armed ? (

@@ -15,7 +15,8 @@
 // Markdown `onLink` handler swaps the rendered doc in place (with a back link),
 // which is the only spot AGENTS.md needs to be reachable from.
 import React from 'react';
-import { AppFrame, L, WF, Markdown } from './primitives.jsx';
+import { AppFrame, L, WF, Markdown, inkBorder } from './primitives.jsx';
+import { useData } from './dataStore.jsx';
 import { ScreenTabs } from './App.jsx';
 import { TopBarControls } from './settings.jsx';
 import readmeText from '../README.md?raw';
@@ -59,6 +60,7 @@ const linkStyle = {
 };
 
 export function WireReadme() {
+  const { goScreen } = useData();
   // 'readme' | 'agents' — which doc is showing. AGENTS.md opens in place rather
   // than as a separate screen (there's no router); the README's link to it is the
   // only entry point.
@@ -90,6 +92,47 @@ export function WireReadme() {
   return (
     <AppFrame topBar={<ScreenTabs />} rightSlot={<TopBarControls />} coverage={false}>
       <div ref={scrollRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
+        {/* Persistent close affordance. Pinned to the top of the scroll area
+            (position:sticky) so it stays on screen the whole time the doc is
+            scrolled, and horizontally anchored just left of the rendered Markdown
+            column — it lives in the left gutter, never over the prose. The
+            zero-height wrapper overlays the content without nudging it; pointer
+            events pass through everywhere except the button. Closing returns to the
+            timeline, the same target as the top-bar `?` toggle. */}
+        <div style={{ position: 'sticky', top: 0, height: 0, zIndex: 5, pointerEvents: 'none' }}>
+          <div style={{ width: README_COL - 48, maxWidth: 'calc(100% - 48px)', margin: '0 auto', position: 'relative' }}>
+            <button
+              aria-label="close help"
+              title="close help — return to the timeline"
+              onClick={() => goScreen('dossier')}
+              style={{
+                pointerEvents: 'auto',
+                position: 'absolute',
+                // Lined up with the page's H1 ("Redlogs — …"): 32px column
+                // padding-top + 10px heading margin-top, nudged to sit on the
+                // scaled heading's text line rather than its top edge.
+                top: 52,
+                right: '100%',
+                marginRight: 16,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 5,
+                padding: 0,
+                border: 'none',
+                background: 'none',
+                fontFamily: WF.monoFont,
+                fontSize: 12,
+                lineHeight: 1,
+                color: WF.ink3,
+                opacity: 0.7,
+                cursor: 'pointer',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              ↰ esc
+            </button>
+          </div>
+        </div>
         <div style={{ maxWidth: README_COL, margin: '0 auto', padding: '32px 24px', boxSizing: 'border-box' }}>
           {view === 'agents' && (
             <L mono size={13} onClick={() => setView('readme')} style={{ display: 'inline-block', marginBottom: 16, ...linkStyle }}>

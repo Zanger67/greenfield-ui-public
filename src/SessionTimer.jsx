@@ -179,6 +179,30 @@ export function SessionTimer() {
     return () => window.removeEventListener('pagehide', onHide);
   }, []);
 
+  // "Reset cache" (the gear popover) wipes the whole session, the timer
+  // included: drop every trace's stored timer and snap the visible one back to a
+  // fresh, unstarted 30:00 — the same clean slate a never-touched timer shows.
+  // No re-persist: a pristine default needs no stored key (loadTimer recreates
+  // it), matching how the overlays are wiped across all traces.
+  React.useEffect(() => {
+    const onReset = () => {
+      try {
+        const keys = [];
+        for (let i = 0; i < localStorage.length; i += 1) {
+          const k = localStorage.key(i);
+          if (k && k.startsWith('redlogs:timer:')) keys.push(k);
+        }
+        keys.forEach((k) => localStorage.removeItem(k));
+      } catch { /* disabled / inaccessible storage — in-memory reset still applies */ }
+      setEditing(false);
+      setConfirmingReset(false);
+      setOpen(false);
+      setTimer(defaultTimer());
+    };
+    window.addEventListener('redlogs:reset-cache', onReset);
+    return () => window.removeEventListener('redlogs:reset-cache', onReset);
+  }, []);
+
   // Cosmetic tick: re-render once a second WHILE running so the digits move. The
   // displayed value is derived from Date.now(), so a missed/throttled tick (e.g.
   // a backgrounded tab) self-corrects on the next render — never drifts.
