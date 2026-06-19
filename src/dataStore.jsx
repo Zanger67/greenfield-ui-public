@@ -187,30 +187,47 @@ function deriveFile(source, rl) {
 // Data/results artifacts the researcher produces — distinct from source
 // content. Extensions are matched case-insensitively. `json`/`jsonl` count as
 // data here even though some are config: in these traces they are almost
-// always eval results / metadata dumps. `log` and `txt` are run output /
-// scratch dumps — and the parser's `data_write_sequence` grouping treats both
-// as data-write extensions, so the UI's class must agree.
+// always eval results / metadata dumps. `log` is run output / scratch dump, and
+// the parser's `data_write_sequence` grouping treats it as a data-write
+// extension, so the UI's class agrees. `diff` is a produced artifact too (saved
+// patch dumps): the UI merges its runs, but the parser's `DATA_FILE_EXTS` does
+// not list it yet, so add `.diff` there to keep the two in agreement.
+//
+// `txt` and `md` count as data here too (writeups, notes, reports, scratch
+// dumps — produced text artifacts, not authored source). They were previously
+// left unclassified; the project now treats them as data.
 const DATA_EXTS = new Set([
   'json', 'jsonl', 'csv', 'tsv', 'parquet', 'arrow', 'feather',
   'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'pdf',
   'npy', 'npz', 'pt', 'pth', 'ckpt', 'safetensors', 'bin',
-  'pkl', 'pickle', 'h5', 'hdf5', 'log', 'txt',
+  'pkl', 'pickle', 'h5', 'hdf5', 'log', 'diff', 'jinja',
+  'txt', 'md',
 ]);
-// Source content the researcher authors.
+// Source content the researcher authors. Note: `md` and `txt` are NOT here —
+// they are classified as data (see DATA_EXTS above), not authored source.
 const CODE_EXTS = new Set([
   'py', 'pyi', 'ipynb', 'js', 'jsx', 'ts', 'tsx', 'sh', 'bash', 'zsh',
-  'md', 'rst', 'toml', 'yaml', 'yml', 'cfg', 'ini', 'env',
+  'rst', 'toml', 'yaml', 'yml', 'cfg', 'ini', 'env',
   'html', 'css', 'scss', 'c', 'cc', 'cpp', 'h', 'hpp', 'rs', 'go',
   'java', 'rb', 'lock', 'sql', 'r',
 ]);
 
 // Classify a path as authored source ('code') vs produced artifact ('data').
 // Returns null when there is no usable extension to judge by.
-function deriveFileClass(file) {
+//
+// First, a path whose ending is `.<dataext>.<suffix>` — a known data extension
+// (json, txt, …) followed by one more all-alphanumeric segment, e.g.
+// `results.json.bak`, `report.txt.old`, `scores.csv.1` — counts as data, ahead
+// of the last-segment check below: it's a data artifact wearing an extra
+// trailing suffix that would otherwise hide its real extension. This is why such
+// files (and deletion/creation groups made entirely of them) read as "data".
+export function deriveFileClass(file) {
   if (!file) return null;
   const base = file.split('/').pop();
+  const tail = base.match(/\.([A-Za-z0-9]+)\.[A-Za-z0-9]+$/);
+  if (tail && DATA_EXTS.has(tail[1].toLowerCase())) return 'data';
   const dot = base.lastIndexOf('.');
-  if (dot <= 0) return null; // no extension, or a dotfile like `.gitignore`
+  if (dot <= 0) return null; // no extension, or a single-dot dotfile like `.gitignore`
   const ext = base.slice(dot + 1).toLowerCase();
   if (DATA_EXTS.has(ext)) return 'data';
   if (CODE_EXTS.has(ext)) return 'code';
@@ -553,6 +570,27 @@ function buildDataset({ name, events, bashIndex, flags, suspicions, aggSuspicion
     const sha = resolveSha(s?.inner_commit_sha) || s?.inner_commit_sha;
     if (sha) (susBySha[sha] = susBySha[sha] || []).push(s);
   }
+  // When more than one AI suspicion lands on the same commit, keep only the
+  // first two alphabetically (by category, then suspicion_id for a stable tie
+  // break) and deactivate the rest — the dropped ones must not surface
+  // anywhere: not on the commit dossier, the overview list, the semantic-areas
+  // screen, nor the areas derived below. Filtering at this single per-sha index
+  // is what makes the drop global: chunk.suspicions reads straight from
+  // susBySha, and keptSuspicions (rebuilt from the survivors) is the list
+  // deriveSemanticAreas consumes.
+  const susSortKey = (s) => `${s?.category || ''} ${s?.suspicion_id || ''}`.toLowerCase();
+  const keptSuspicionSet = new Set();
+  for (const key of Object.keys(susBySha)) {
+    const kept = [...susBySha[key]]
+      .sort((a, b) => susSortKey(a).localeCompare(susSortKey(b)))
+      .slice(0, 2);
+    susBySha[key] = kept;
+    for (const s of kept) keptSuspicionSet.add(s);
+  }
+  const keptSuspicions = suspicions.filter((s) => {
+    const sha = resolveSha(s?.inner_commit_sha) || s?.inner_commit_sha;
+    return !sha || keptSuspicionSet.has(s);
+  });
   const aggBySha = {};
   for (const a of aggSuspicions) {
     const sha = resolveSha(a?.inner_commit_sha) || a?.inner_commit_sha;
@@ -596,6 +634,26 @@ function buildDataset({ name, events, bashIndex, flags, suspicions, aggSuspicion
     }
   }
 
+  // Event ids are NOT guaranteed unique. Audit events with no `id` collapse to
+  // `''` upstream (parse.py: `d.get("id", "")`), and session boundaries reuse
+  // literal ids (`session_start` / `session_end`, the sync reconciliation) on
+  // every session — so a multi-session trace ships several events sharing one
+  // id, plus a cluster of id-less ones. Left as-is that breaks identity three
+  // ways: `byId` drops all but the last collision, React row keys collide, and
+  // — the visible symptom — `findIndex(c => c.id === currentId)` and the
+  // scroll-into-view ref both resolve a *later* instance back to the FIRST one,
+  // so stepping off a session row yanks the list up to the first session marker.
+  // Hand every chunk a unique, deterministic id: keep the first occurrence's
+  // raw id verbatim (so persisted overlays / deep-links are untouched in the
+  // common all-unique case) and disambiguate repeats / blanks with a stable
+  // per-id counter. Diffs join on `sha`, not this id, so suffixing is safe.
+  const idSeen = new Map();
+  const uniqueId = (rawId, source, sha) => {
+    const base = rawId || `evt:${source || 'audit'}:${sha || 'nosha'}`;
+    const n = idSeen.get(base) || 0;
+    idSeen.set(base, n + 1);
+    return n === 0 ? base : `${base}#${n}`;
+  };
   // Build a chunk-shaped record per event.
   const chunks = events.map((e) => {
     const rl = safeParseRawLine(e.raw_line);
@@ -632,14 +690,18 @@ function buildDataset({ name, events, bashIndex, flags, suspicions, aggSuspicion
     // non-empty wins when more than one agent annotated the same commit.
     const shortTitle = annoList.find((a) => a && a.short_title)?.short_title || '';
     const annotationText = annoList.find((a) => a && a.annotation)?.annotation || '';
-    // Highest individual flag level for ranking in the inbox; aggregate
-    // record (if present) is the authoritative max.
-    const flagLevel = susAgg?.flag_level_max || susList.reduce((best, s) => {
-      return (FLAG_LEVEL_RANK[s.flag_level] || 0) > (FLAG_LEVEL_RANK[best] || 0) ? s.flag_level : best;
-    }, null);
+    // Highest flag level among the suspicions that survive the per-commit
+    // alphabetical cut above — so the inbox level chip never advertises a
+    // severity whose suspicion was dropped. The aggregate record's max is only
+    // a fallback for commits that carry an agg row but no per-sha suspicions.
+    const flagLevel = (susList.length
+      ? susList.reduce((best, s) => (
+          (FLAG_LEVEL_RANK[s.flag_level] || 0) > (FLAG_LEVEL_RANK[best] || 0) ? s.flag_level : best
+        ), null)
+      : null) || susAgg?.flag_level_max || null;
     const heatBucket = FLAG_LEVEL_HEAT[flagLevel] || (preFlag ? 2 : 0);
     return {
-      id: e.event_id,
+      id: uniqueId(e.event_id, source, sha),
       sha,
       t,
       tEnd: t,
@@ -696,7 +758,7 @@ function buildDataset({ name, events, bashIndex, flags, suspicions, aggSuspicion
     if (c.sha && !(c.sha in bySha)) bySha[c.sha] = c;
   }
   // Semantic areas: derived now, not loaded — see deriveSemanticAreas.
-  const semanticAreas = deriveSemanticAreas(suspicions, bySha, clusters, resolveSha);
+  const semanticAreas = deriveSemanticAreas(keptSuspicions, bySha, clusters, resolveSha);
   // Semantic threads: the thread_agent's lines of work, ordered for the screen.
   const threads = deriveThreads(threadAnnotations, bySha, resolveSha);
 

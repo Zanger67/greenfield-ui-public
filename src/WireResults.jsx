@@ -61,6 +61,9 @@ export const plotKey = (file) => `plot:${file}`;
 // above "other docs", per the screen's reading order.
 const GROUP_SUPP = 'Supplemental materials';
 const GROUP_OTHER = 'Other docs';
+// Loose .md/.pdf/.txt docs discovered at the trace root (anything not already
+// shown by name), surfaced in their own section below the package "other docs".
+const GROUP_EXTRA = 'Additional materials';
 
 // How the nav treats a doc the trace doesn't ship:
 //   'none' — keep it in the nav, greyed + badged "(none)" (the standardized set,
@@ -127,6 +130,11 @@ function suppBlurb(name) {
 // relative path keeps it unique within the trace; the `supp:` prefix is what
 // collectDocMarkups keys off to resolve a path back for export.
 const suppId = (rel) => `supp:${rel}`;
+
+// The id for a loose root-level doc (see listRootDocs in vite.config). Keyed
+// `root:<file>` — the trace-root analogue of `supp:`; collectDocMarkups resolves
+// it back to the bare filename at the trace root for export.
+const rootDocId = (rel) => `root:${rel}`;
 
 // Figures emitted under main_results/. The comparison_* bars and iteration_*
 // line charts are the two plot families plotting.py produces per task/actor.
@@ -229,11 +237,34 @@ export function WireResults() {
     [suppKey], // eslint-disable-line react-hooks/exhaustive-deps
   );
 
+  // Loose .md/.pdf/.txt docs the selected trace ships at its root (from the same
+  // manifest as the supplemental listing; see listRootDocs in vite.config). One
+  // nav entry each, fetched from the bare filename at the trace root, grouped
+  // under "Additional materials".
+  const rootList = React.useMemo(
+    () => (Array.isArray(currentTrace?.rootDocs) ? currentTrace.rootDocs : []),
+    [currentTrace],
+  );
+  const rootKey = rootList.join('\n');
+
+  const rootDocs = React.useMemo(
+    () => rootList.map((rel) => ({
+      id: rootDocId(rel),
+      kind: kindForFile(rel),
+      label: rel,
+      path: rel,
+      group: GROUP_EXTRA,
+      blurb: suppBlurb(rel),
+      onMissing: 'hide',
+    })),
+    [rootKey], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+
   // The full nav set in render order: standardized docs, then supplemental files,
-  // then the package-level other docs.
+  // then the package-level other docs, then the loose root-level docs.
   const docList = React.useMemo(
-    () => [...STANDARD_DOCS, ...suppDocs, ...OTHER_DOCS],
-    [suppDocs],
+    () => [...STANDARD_DOCS, ...suppDocs, ...OTHER_DOCS, ...rootDocs],
+    [suppDocs, rootDocs],
   );
 
   React.useEffect(() => {
@@ -272,7 +303,7 @@ export function WireResults() {
       setStatus('ready');
     });
     return () => { cancelled = true; };
-  }, [selectedInput, suppKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [selectedInput, suppKey, rootKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Deep-link target: the overview routes a flagged/annotated doc here as a
   // `doc:<id>` focus token (see openDoc). Select that doc when the token names a
@@ -294,6 +325,45 @@ export function WireResults() {
     (d) => (d.kind === 'plots' ? plots.length > 0 : needsText(d) ? !!docs[d.id] : true),
     [docs, plots],
   );
+
+  // Flat top-to-bottom order of the nav, used by keyboard navigation so ↑/↓ walk
+  // the visible left column the same way the timeline + groups screens walk
+  // theirs. Only selectable (available) docs are navigable — missing-but-shown
+  // "(none)" rows and hidden-when-missing docs are skipped, matching what the nav
+  // renders as a clickable button. docList is already in render order and each
+  // group's docs sit contiguously, so its order is the rail's order.
+  const navIds = React.useMemo(
+    () => docList.filter(isAvailable).map((d) => d.id),
+    [docList, isAvailable],
+  );
+
+  // Keyboard transport for the nav, mirroring the timeline + groups screens: ↑ / ↓
+  // step the selection up / down the visible left column. We claim the key in the
+  // capture phase and stopPropagation so the data store's global arrow handler —
+  // which walks chunks chronologically and is meaningless on this doc screen —
+  // doesn't also fire. Skipped in text fields / with a modifier held; ←/→ fall
+  // through to the global handler untouched (same as the groups screen).
+  React.useEffect(() => {
+    const onKey = (e) => {
+      if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+      const t = e.target;
+      const tag = t && t.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return;
+      let dir = 0;
+      if (e.key === 'ArrowUp') dir = -1;
+      else if (e.key === 'ArrowDown') dir = 1;
+      else return;
+      if (navIds.length === 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const idx = navIds.indexOf(selId);
+      const base = idx < 0 ? (dir > 0 ? -1 : 0) : idx;
+      const next = Math.max(0, Math.min(navIds.length - 1, base + dir));
+      if (navIds[next] !== selId) { setSelId(navIds[next]); recordFocus(`doc:${navIds[next]}`); }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [navIds, selId, recordFocus]);
 
   // Auditor markups per doc, surfaced as a nav badge so a flagged / annotated
   // doc is visible at a glance — and so the propagation to the overview has a
@@ -418,6 +488,16 @@ function ResultsNav({ width, docs, selId, onSelect, isAvailable, markFor, loadin
     if (!g) { g = { name: d.group, items: [] }; groups.push(g); }
     g.items.push(d);
   }
+  // Keep the selected doc in view as ↑/↓ keyboard navigation walks the column
+  // (and when a deep-link from another screen selects an off-screen doc). `selRef`
+  // is attached to the active button; `nearest` makes it a no-op when that button
+  // is already visible, so plain clicks don't jump the rail. Mirrors the groups
+  // screen's selRef recentering.
+  const selRef = React.useRef(null);
+  React.useEffect(() => {
+    const el = selRef.current;
+    if (el) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }, [selId]);
   return (
     <div
       style={{
@@ -445,6 +525,7 @@ function ResultsNav({ width, docs, selId, onSelect, isAvailable, markFor, loadin
             return (
               <button
                 key={d.id}
+                ref={active ? selRef : undefined}
                 type="button"
                 disabled={!available && !loading}
                 onClick={() => available && onSelect(d.id)}

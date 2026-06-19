@@ -76,6 +76,16 @@ const DEFAULTS = {
   // data store neutralizes the exposed data at the source when this is off —
   // see withSuspicionGate in dataStore.jsx.
   showAiSuspicion: false,
+  // Within the overview ("auditor output") view, the AI suspicion sections —
+  // "Suspicion (pre-flagged by AI analysis)" and its user-dismissed counterpart
+  // — get a SECOND, stricter gate on top of `showAiSuspicion`. The overview is
+  // the auditor's consolidated deliverable view, so we don't want the model's
+  // pre-flags dominating it even once the AI layer is switched on elsewhere;
+  // these sections stay hidden until the auditor opts in here. Defaults OFF.
+  // Pure view gate (no data effect): read straight from useSettings in
+  // WireOverview and ANDed with showAiSuspicion — no suspicion data exists while
+  // the master layer is off, so the sections only ever show when both are on.
+  showOverviewSuspicion: false,
   // The deterministic pre-flag layer — the chunker's flags.jsonl anomalies
   // (`add_then_remove`, `run_scrapped`, …) surfaced as the muted "ⓘ note" chips,
   // gutter marks, the group pre-flag rollups, and their share of the suspect
@@ -95,14 +105,15 @@ const DEFAULTS = {
   showTagFlagsHint: false,
   // Merge long runs of consecutive data-file operations (data-class commits and
   // all-data groups) in the dossier timeline into a single "many data file
-  // modifications" cell, tagged with the extensions it covers. Defaults OFF —
-  // the full per-commit stream is the baseline; flip it on when a trace's data
-  // writes (logs, jsonl dumps, checkpoints) bury the source edits. Clicking a
-  // merged cell collapses the main timeline to a thin reopen bar and opens a
-  // focused sub-timeline scoped to just that run (see <DataMergeRow> /
-  // <DataDrillPane> in WireDossierInbox). Purely a render-time grouping —
-  // navigation, filters, and the export still operate on the underlying commits.
-  mergeDataOps: false,
+  // modifications" cell, tagged with the extensions it covers. Defaults ON —
+  // data writes (logs, jsonl dumps, checkpoints) routinely bury the source
+  // edits, so the collapsed stream is the better baseline; flip it off from the
+  // gear popover to see the full per-commit stream. Clicking a merged cell
+  // collapses the main timeline to a thin reopen bar and opens a focused
+  // sub-timeline scoped to just that run (see <DataMergeRow> / <DataDrillPane>
+  // in WireDossierInbox). Purely a render-time grouping — navigation, filters,
+  // and the export still operate on the underlying commits.
+  mergeDataOps: true,
   // "Anonymous mode" — a privacy screen for screenshots / screen-shares / external
   // demos. When ON, every piece of on-screen text DERIVED FROM THE TRACE (code,
   // diffs, commands, agent/narrator annotations, commit messages, file paths,
@@ -286,7 +297,7 @@ export function TagFlagsHint({ noun, style }) {
 // Lives at the far right of the top bar. A small unobtrusive gear; clicking it
 // drops a popover with the available toggles. Closes on outside-click / Escape.
 export function SettingsButton() {
-  const { showTimestamps, showCommitHashes, showLineNumbers, showAuditEventBox, showDeterministicFlags, inboxSubline, inboxTitleFromShortTitle, showTagFlagsHint, mergeDataOps, anonymize, setSetting } = useSettings();
+  const { showTimestamps, showCommitHashes, showLineNumbers, showAuditEventBox, showDeterministicFlags, showOverviewSuspicion, inboxSubline, inboxTitleFromShortTitle, showTagFlagsHint, mergeDataOps, anonymize, setSetting } = useSettings();
   const [open, setOpen] = React.useState(false);
   const wrapRef = React.useRef(null);
 
@@ -377,6 +388,14 @@ export function SettingsButton() {
               hint="chunker pre-flags (add-then-remove, run-scrapped)"
               checked={showDeterministicFlags}
               onChange={(v) => setSetting('showDeterministicFlags', v)}
+            />
+          </div>
+          <div style={{ marginTop: 12 }}>
+            <ToggleRow
+              label="show suspicion in overview"
+              hint="AI pre-flag sections on the output view (needs AI flags on)"
+              checked={showOverviewSuspicion}
+              onChange={(v) => setSetting('showOverviewSuspicion', v)}
             />
           </div>
           <div style={{ marginTop: 12 }}>

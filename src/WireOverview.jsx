@@ -14,7 +14,7 @@ import {
 } from './primitives.jsx';
 import { useData } from './dataStore.jsx';
 import { ScreenTabs } from './App.jsx';
-import { TopBarControls, Sha, useAnonymize } from './settings.jsx';
+import { TopBarControls, Sha, useAnonymize, useSettings } from './settings.jsx';
 import { usergroupKey, reverseTagIndex, useDescribeTarget, GroupTagChips } from './Tagging.jsx';
 import { collectGroupMarkups, collectSemanticMarkups, collectDocMarkups, collectPlotMarkups } from './auditExport.js';
 
@@ -28,6 +28,12 @@ export function WireOverview() {
   const { data, rawData, showAiSuspicion, openCommit, openArea, openThread, openGroup, openDoc, openUserGroup, toggleDismiss, flaggedOverlay = {}, userNotesOverlay = {}, userGroupsOverlay = {}, groupTagsOverlay = {} } = useData();
   const { chunks, coverage, meta, semanticAreas = [], threads = [] } = data;
   const describe = useDescribeTarget();
+  // The overview's AI-suspicion sections sit behind a stricter gate than the
+  // rest of the app — the master AI-flags pill AND this dedicated, default-off
+  // setting (see showOverviewSuspicion in settings.jsx). Read as a view-only
+  // gate; the master pill still governs whether the suspicion data exists.
+  const { showOverviewSuspicion } = useSettings();
+  const showSuspicionSections = showAiSuspicion && showOverviewSuspicion;
 
   // The auditor's user groups, each with its resolved member list + annotations,
   // so the consolidated output shows what was grouped and any group-level notes.
@@ -279,12 +285,16 @@ export function WireOverview() {
             onOpenGroup={openUserGroup}
           />
 
-          {/* The AI suspicion sections are gated behind the top-bar AI-flags
-              pill (default off, anti-anchoring). When off the data store has
-              already neutralized these chunks; hiding the sections too keeps
-              their headers/empty-state from advertising a layer the auditor
-              chose to silence. */}
-          {showAiSuspicion && (
+          {/* The AI suspicion sections carry a stricter gate than the rest of
+              the app: the top-bar AI-flags pill (default off, anti-anchoring)
+              AND a dedicated "show suspicion in overview" setting (also default
+              off — see showOverviewSuspicion). The overview is the auditor's
+              consolidated deliverable, so the model's pre-flags stay out of it
+              until explicitly opted in, even once the AI layer is on elsewhere.
+              When the master pill is off the data store has already neutralized
+              these chunks, so the AND also means no empty header advertises a
+              silenced layer. */}
+          {showSuspicionSections && (
             <OverviewSection
               title="Suspicion (pre-flagged by AI analysis)"
               accent={WF.heat4}
@@ -297,7 +307,7 @@ export function WireOverview() {
               onDismiss={toggleDismiss}
             />
           )}
-          {showAiSuspicion && dismissedSuspicion.length > 0 && (
+          {showSuspicionSections && dismissedSuspicion.length > 0 && (
             <OverviewSection
               title="Suspicion flagged by agent — user dismissed"
               accent={WF.heat2}

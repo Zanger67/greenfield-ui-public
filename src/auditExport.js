@@ -136,10 +136,12 @@ export function collectSemanticMarkups(semanticAreas, threads, flaggedOverlay, u
 }
 
 // Result-document markups (`doc:<id>` overlay keys). The static result/other
-// docs (RESULTS_DOCS) supply nice labels + paths; supplemental files are dynamic
-// (per-trace, keyed `doc:supp:<relpath>`) so they aren't in that set — any other
-// `doc:` key carrying a flag / note / group-tag is swept in too, with its path
-// and label recovered from the key, so dynamic docs still export.
+// docs (RESULTS_DOCS) supply nice labels + paths; the dynamic per-trace docs
+// aren't in that set — supplemental files (keyed `doc:supp:<relpath>`, under
+// supplemental_materials/) and loose root-level docs (keyed `doc:root:<file>`,
+// at the trace root). Any other `doc:` key carrying a flag / note / group-tag is
+// swept in too, with its path and label recovered from the key, so dynamic docs
+// still export.
 export function collectDocMarkups(flaggedOverlay, userNotesOverlay, includeKeys = EMPTY_KEYS) {
   const metaByKey = new Map();
   for (const d of RESULTS_DOCS) {
@@ -149,10 +151,11 @@ export function collectDocMarkups(flaggedOverlay, userNotesOverlay, includeKeys 
     if (!key.startsWith('doc:') || metaByKey.has(key)) continue;
     const id = key.slice(4);
     const isSupp = id.startsWith('supp:');
+    const isRoot = id.startsWith('root:');
     metaByKey.set(key, {
       docId: id,
-      path: isSupp ? `supplemental_materials/${id.slice(5)}` : null,
-      title: isSupp ? id.slice(5) : id.replace(/_/g, ' '),
+      path: isSupp ? `supplemental_materials/${id.slice(5)}` : isRoot ? id.slice(5) : null,
+      title: isSupp ? id.slice(5) : isRoot ? id.slice(5) : id.replace(/_/g, ' '),
     });
   }
   const out = [];

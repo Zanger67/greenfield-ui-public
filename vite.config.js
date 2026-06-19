@@ -188,6 +188,40 @@ function listSupplemental(traceDir) {
   return out;
 }
 
+// Loose docs sitting directly at the trace root that the results screen surfaces
+// under "Additional materials": any .md/.pdf/.txt file in the trace folder that
+// isn't already shown elsewhere on that screen. The skip set mirrors the fixed
+// root docs WireResults renders by name (the blue-team / process docs + the
+// package "other docs"), plus AI_AUDIT.md — the auditor's own exported
+// deliverable, commonly written back to the trace root, which the docs page
+// should not echo. Top level only (no recursion), so main_results/ and the
+// reconstructed codebase stay out. Returns filenames relative to the trace root,
+// sorted; [] when the dir can't be read. Like listSupplemental, this rides along
+// in /data/index.json so it works the same in the dev server and a static build.
+const ROOT_DOC_EXTS = new Set(['md', 'pdf', 'txt']);
+const ROOT_DOCS_SKIP = new Set([
+  'ai_audit.md',                                              // the UI's own export deliverable
+  'readme.md', 'claude.md', 'agents.md',                     // OTHER_DOCS in WireResults
+  'blue_team_report.md',                                     // STANDARD_DOCS · Audit
+  'experiment_description.md', 'guide_to_my_experiments.md', // STANDARD_DOCS · Process
+]);
+function listRootDocs(traceDir) {
+  if (!traceDir) return [];
+  let entries;
+  try { entries = fs.readdirSync(traceDir, { withFileTypes: true }); }
+  catch { return []; }
+  const out = [];
+  for (const e of entries) {
+    if (!e.isFile() || e.name.startsWith('.')) continue;
+    const ext = (e.name.split('.').pop() || '').toLowerCase();
+    if (!ROOT_DOC_EXTS.has(ext)) continue;
+    if (ROOT_DOCS_SKIP.has(e.name.toLowerCase())) continue;
+    out.push(e.name);
+  }
+  out.sort((a, b) => a.localeCompare(b));
+  return out;
+}
+
 // Trace discovery. The selectable inputs are the subdirectories of public/data
 // that hold a trace (marked by a metadata.json), PLUS — when this repo sits
 // inside a trace's output folder — the surrounding parent trace (see
@@ -216,6 +250,7 @@ function discoverInputs() {
       label: readUiName(path.join(PUBLIC_DATA, e.name)) || e.name,
       source: 'public/data',
       supplemental: listSupplemental(path.join(PUBLIC_DATA, e.name)),
+      rootDocs: listRootDocs(path.join(PUBLIC_DATA, e.name)),
     }));
   // The surrounding trace joins the public/data traces as a peer. Skip it only
   // when a dropped trace already claims the same name (public/data owns path
@@ -229,6 +264,7 @@ function discoverInputs() {
       label: readUiName(parent.dir) || parent.name,
       source: 'parent',
       supplemental: listSupplemental(parent.dir),
+      rootDocs: listRootDocs(parent.dir),
     });
   }
   inputs.sort((a, b) =>

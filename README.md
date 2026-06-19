@@ -307,13 +307,14 @@ reloads, and tab close. The two most consequential controls — **AI flags** and
 
 | Setting (key) | Where | What it does | Default |
 | --- | --- | --- | --- |
-| `showAiSuspicion` | top bar — **AI flags** pill | Master switch for the entire AI suspicion layer: narrator flag levels, the heat gutter, the suspect filter facet, flagged semantic areas, and the overview suspicion sections. When off, the data is gated at the source — not just hidden. | **off** |
+| `showAiSuspicion` | top bar — **AI flags** pill | Master switch for the entire AI suspicion layer: narrator flag levels, the heat gutter, the suspect filter facet, and flagged semantic areas. When off, the data is gated at the source — not just hidden. (The overview's suspicion sections take a second, stricter gate — see `showOverviewSuspicion`.) | **off** |
 | `darkMode` | top bar — **🌙/🔆** | Dark / light palette (a CSS-variable flip on `<html data-theme>`; applied pre-paint so there's no flash on load). | **on (dark)** |
 | `showTimestamps` | gear — *show times & dates* | Literal date/time strings on edits and log items. Relationship signals ("N commits between", file order) stay visible regardless. | off |
 | `showCommitHashes` | gear — *show commit hashes* | Short SHAs on list rows and headers (often the quickest cross-reference back to the trace). | off |
 | `showLineNumbers` | gear — *show line numbers* | Old/new line-number gutter on source-file diffs. (Append-only log views have no hunk headers, so it doesn't apply there.) | on |
 | `showAuditEventBox` | gear — *show audit event box* | The raw audit-event payload box (file / event / action / baseline) on file-edit dossiers — a low-level detail most of an audit doesn't need surfaced. | off |
 | `showDeterministicFlags` | gear — *show deterministic flags* | The chunker's deterministic pre-flag layer (`flags.jsonl` anomalies — `add_then_remove`, `run_scrapped`, …): the muted "ⓘ note" chips, gutter marks, group pre-flag rollups, and their share of the suspect filter facet. Heuristic notes, not verdicts, so off by default; gated at the source when off — not just hidden. | **off** |
+| `showOverviewSuspicion` | gear — *show suspicion in overview* | Whether the overview ("auditor output") view shows the AI suspicion sections ("Suspicion (pre-flagged by AI analysis)" + its dismissed counterpart). Off by default so the auditor's consolidated deliverable isn't dominated by the model's pre-flags even when **AI flags** is on. Layered on top of `showAiSuspicion` — both must be on for the sections to appear. | **off** |
 | `inboxSubline` | gear — *inbox subline* | What the greyed second line under each inbox row shows: `operation` (raw audit op) · `short title` (annotation headline) · `description` (clipped "what's being done") · `none`. | `none` |
 | `inboxTitleFromShortTitle` | gear — *title from short title* | Use the annotation agent's short headline as the row's primary line (instead of the touched file) when one exists. | on |
 | `showTagFlagsHint` | gear — *tag-flags hint* | Shows the "adding a tag flags this …" reminder under each tag editor. A learn-once mechanic, so it's off once you know it. | off |

@@ -71,6 +71,16 @@ export function WireReadme() {
   // returning) starts at its heading instead of mid-page.
   React.useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = 0; }, [view]);
 
+  // Escape closes the help screen and returns to the timeline — the same target
+  // as the persistent close button (labeled "↰ esc") and the top-bar `?` toggle.
+  // This is app documentation with no text fields of its own, so the binding is
+  // unconditional.
+  React.useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') goScreen('dossier'); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [goScreen]);
+
   // Markdown link handler for the help docs. AGENTS.md (the one in-app target)
   // swaps this screen to the schema doc; `#…` anchors smooth-scroll to the heading
   // with that slug; external URLs open in a new tab; anything else is ignored so

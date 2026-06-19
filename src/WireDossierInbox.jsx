@@ -23,7 +23,7 @@ import {
   PaneResizer,
   renderInline,
 } from './primitives.jsx';
-import { useData } from './dataStore.jsx';
+import { useData, deriveFileClass } from './dataStore.jsx';
 import { ScreenTabs, CheckoutContext } from './App.jsx';
 import { TopBarControls, Stamp, Sha, TagFlagsHint, useSettings, useAnonymize, PANE_DEFAULTS } from './settings.jsx';
 import { ValidatorNotesEditor } from './ValidatorNotes.jsx';
@@ -303,7 +303,10 @@ export function WireDossierInbox() {
   //   • we're inside the data drill (walk that focused subset).
   // Otherwise we don't claim the key — the global handler already walks every
   // commit, the same set. Skipped in text fields / with a modifier held.
-  const navOverride = filterActive || mergeDataOps || !!drillItem;
+  // A selected commit group also claims the arrows (even with no filter/merge/
+  // drill): its members must be walked relative to the group, not the stale
+  // single-commit currentId the global handler would step from.
+  const navOverride = filterActive || mergeDataOps || !!drillItem || !!groupSel;
   React.useEffect(() => {
     if (!navOverride) return undefined;
     const onKey = (e) => {
@@ -328,28 +331,104 @@ export function WireDossierInbox() {
         }
         return -1;
       };
+      // Keyboard stepping nudges (minimal scroll), unlike the out-of-list jumps
+      // selectCommit/selectInDrill assume — they set 'center', so re-assert
+      // 'nearest' after, which the re-center effect reads on the next render.
+      const step = (id) => { (drillItem ? selectInDrill : selectCommit)(id); scrollModeRef.current = 'nearest'; };
+      // A selected commit group anchors navigation to its own span instead of
+      // `currentId` — that's the last-open single commit, which may sit anywhere
+      // in the list (or off it), so stepping off it makes the cursor jump around.
+      // The group sits just above its first member: ↓/→ enters it (lands on the
+      // first member), ↑/← steps to the commit just above the group. Selecting a
+      // member clears groupSel, so further arrows fall through to ordinary
+      // per-commit stepping below — and GroupRow auto-expands its "… N more"
+      // rows around whichever member becomes current.
+      if (groupSel) {
+        const gStart = list.findIndex((c) => c.id === groupSel.members[0].id);
+        if (gStart >= 0) {
+          const next = findNavigable(dir > 0 ? gStart - 1 : gStart, dir);
+          if (next >= 0) step(list[next].id);
+          return;
+        }
+      }
       const idx = currentId ? list.findIndex((c) => c.id === currentId) : -1;
       // No current selection → land on the first navigable row; otherwise step
       // one navigable row in `dir`, skipping merged commits.
       const next = idx < 0 ? findNavigable(-1, 1) : findNavigable(idx, dir);
       // Inside the drill, route through selectInDrill so the first hop replaces
       // the empty drill-open entry (back/forward skip it) just like a click does.
-      if (next >= 0 && next !== idx) (drillItem ? selectInDrill : selectCommit)(list[next].id);
+      if (next >= 0 && next !== idx) step(list[next].id);
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [navOverride, drillItem, filteredRows, mergedIds, currentId, selectCommit, selectInDrill]);
+  }, [navOverride, drillItem, filteredRows, mergedIds, currentId, groupSel, selectCommit, selectInDrill]);
 
-  const sel = currentId ? byId[currentId] : chunks[0];
+  // Escape backs out of a drilled data run. Clicking a merged "many data file
+  // modifications" cell drills into that data-write run (openDataDrill); Esc
+  // collapses back to the full timeline — the same exit as the reopen bar
+  // (CollapsedPrimaryBar / closeDataDrill). Bound only while drilled in, claimed
+  // in the capture phase like the arrow transport above, and skipped while focus
+  // is in a text field so an input's own Esc keeps working.
+  React.useEffect(() => {
+    if (!drillItem) return undefined;
+    const onKey = (e) => {
+      if (e.key !== 'Escape') return;
+      if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+      const t = e.target;
+      const tag = t && t.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      closeDataDrill();
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [drillItem, closeDataDrill]);
 
-  // Re-center the active row whenever the selected commit changes. Clicking a
-  // cell in the bottom heatmap (or any out-of-list jump) lands here and pulls
-  // the matching dossier row into the middle of the visible area.
+  // Nothing is selected until the auditor picks a commit. Opening (or switching
+  // to) a trace lands on a clean slate — no row highlighted, the dossier pane
+  // empty, the left list parked at the top — rather than auto-opening the first
+  // commit. `↓` (handled below / by the store's global arrow key) steps onto the
+  // first commit from here. `byId[currentId]` can miss when a remembered id no
+  // longer resolves (filters, a different trace), which also reads as nothing
+  // selected — same clean slate.
+  const sel = currentId ? byId[currentId] || null : null;
+
+  // The file-timeline rail anchors on one commit. A plain selection uses `sel`;
+  // a same-file commit group (e.g. a code edit_sequence) keeps the rail present
+  // too, anchored on the group's first (oldest) commit — members[0] — so the
+  // chain opens centered on where the group begins in the file's life. The
+  // chain itself is identical for every commit of the path (only the "you are
+  // here" marker moves), so this just picks the marker. Multi-file groups have
+  // no single file history, so the rail stays hidden for them.
+  const timelineChunk = groupSel
+    ? (groupSingleFile(groupSel) ? groupSel.members[0] : null)
+    : sel;
+
+  // Reposition the active row when the selected commit changes — but only when
+  // it actually needs it. If the row is already fully on screen we leave the
+  // scroll alone: stepping ↑/↓ between visible commits (incl. the low session /
+  // sync rows) shouldn't yank the list, which is what read as "scrolling jumps
+  // around". When the row IS off screen we bring it in — 'center' for an
+  // out-of-list jump (heatmap cell, file timeline, scrubber, a deep link),
+  // 'nearest' for keyboard stepping that just walked off an edge, so the list
+  // nudges by the minimum instead of recentering every step.
   React.useEffect(() => {
     const el = currentRowRef.current;
+    const container = listRef.current;
+    const mode = scrollModeRef.current;
+    // Default the NEXT change to a minimal nudge. Out-of-list jumps re-assert
+    // 'center' before they navigate (selectCommit); the only path that leans on
+    // this default is the store's global arrow handler, which we want to nudge,
+    // not recenter, on every step.
+    scrollModeRef.current = 'nearest';
     if (!el) return;
-    el.scrollIntoView({ block: scrollModeRef.current === 'nearest' ? 'nearest' : 'center', behavior: 'smooth' });
-    scrollModeRef.current = 'center';
+    if (container) {
+      const cr = container.getBoundingClientRect();
+      const er = el.getBoundingClientRect();
+      if (er.top >= cr.top && er.bottom <= cr.bottom) return; // already fully visible
+    }
+    el.scrollIntoView({ block: mode === 'nearest' ? 'nearest' : 'center', behavior: 'smooth' });
   }, [currentId]);
 
   // The sync arrow at the top of the scroll gutter: jump back to the open commit.
@@ -521,7 +600,7 @@ export function WireDossierInbox() {
 
         {groupSel ? (
           <GroupDossier group={groupSel} onSelectCommit={selectCommit} />
-        ) : sel && (
+        ) : sel ? (
           <DossierBody
             chunk={sel}
             byId={byId}
@@ -531,9 +610,11 @@ export function WireDossierInbox() {
             onCheckout={() => checkout.checkout(sel.sha, selectedInput)}
             onNavigate={selectCommit}
           />
+        ) : (
+          <EmptyDossier />
         )}
 
-        {!groupSel && sel && (
+        {timelineChunk && (
           <>
             <PaneResizer
               width={paneWidths.fileTimeline}
@@ -543,7 +624,10 @@ export function WireDossierInbox() {
               dflt={256}
               dir={-1}
             />
-            <FileTimeline chunk={sel} byId={byId} onNavigate={selectCommit} width={paneWidths.fileTimeline} />
+            {/* Group selections keep group-level notes in GroupDossier, so the
+                rail drops its per-commit validator-notes box and gives the chain
+                the full height. */}
+            <FileTimeline chunk={timelineChunk} byId={byId} onNavigate={selectCommit} width={paneWidths.fileTimeline} showNotes={!groupSel} />
           </>
         )}
       </div>
@@ -1002,7 +1086,7 @@ function CommitRow({ row, current, checkedOut, pendingCheckout, onSelect, onHold
           {levelStyle && (
             <Chip
               style={{ background: levelStyle.bg, color: levelStyle.fg, borderColor: levelStyle.bg }}
-              title={(row.suspicions[0]?.category || 'flagged') + (row.suspicionAgg?.agreement_count > 1 ? ` · ${row.suspicionAgg.agreement_count} agents` : '')}
+              title={row.suspicions[0]?.category || 'flagged'}
             >{levelStyle.label}</Chip>
           )}
           {row.flag && <Chip style={{ background: WF.paperAlt, color: WF.ink2, borderColor: WF.rule2 }} title="heuristic note (not a verdict): produced-then-deleted output — common in iteration, and possibly a logging-process artifact">ⓘ note · {row.flag.kind}</Chip>}
@@ -1082,6 +1166,17 @@ function groupFileClass(members) {
   if (data && !code) return 'data';
   if (code && !data) return 'code';
   return null;  // mixed, or nothing classifiable
+}
+
+// The single path every member of a group touches, or null when they differ /
+// any member is fileless. Only a same-file run (the common case being a code
+// edit_sequence) has a meaningful file timeline — the rail is per-path — so this
+// is what gates keeping the timeline rail open while a group is selected.
+function groupSingleFile(group) {
+  const ms = group && group.members;
+  if (!ms || !ms.length || !ms[0].file) return null;
+  const f = ms[0].file;
+  return ms.every((m) => m.file === f) ? f : null;
 }
 
 // Severity ordering for rolling member flags up to the group level.
@@ -1272,9 +1367,25 @@ function collapseDataRuns(items) {
   return out;
 }
 
+// The whole-group annotation for a commit that belongs to a multi-commit group:
+// the group-level annotation_agent note the group dossier labels "whole group"
+// (annotationsByGroup[groupId]). Used as the short-title fallback for a member or
+// file-timeline node that has no per-commit short_title — so the row says what
+// the group was doing instead of just repeating the path. '' when the commit has
+// no group or its group carries no annotation. Prefers the annotation text (what
+// the dossier surfaces under "whole group"), falling back to the group short_title.
+function wholeGroupAnnotation(chunk, annotationsByGroup) {
+  if (!chunk || !chunk.groupId || !annotationsByGroup) return '';
+  const annos = annotationsByGroup[chunk.groupId];
+  if (!annos || !annos.length) return '';
+  const hit = annos.find((a) => a && (a.annotation || a.short_title));
+  return hit ? (hit.annotation || hit.short_title) : '';
+}
+
 // How many member commits the collapsed group shows inline before the rest
-// fold into a single "… N more" ellipsis row. Click the ellipsis (or the
-// header) to open the group dossier — every commit + the full file tree.
+// fold into a single "… N more events" ellipsis row. Click the ellipsis to
+// spill the full member list inline; click the header to open the group
+// dossier — every commit + the full file tree.
 const MAX_INLINE_MEMBERS = 5;
 
 // Left-pane collapsed group: a regular-sized header naming the group, plus its
@@ -1283,18 +1394,29 @@ const MAX_INLINE_MEMBERS = 5;
 function GroupRow({ group, currentGroup, currentCommitId, currentRowRef, checkout, onSelectGroup, onSelectCommit }) {
   const anon = useAnonymize();
   const [open, setOpen] = React.useState(true);
-  const { flaggedOverlay = {} } = useData();
+  // The full member list spilled inline — set by the "… N more events" row, but
+  // also by selecting the group header or any member commit, so engaging with a
+  // truncated group (e.g. a big data-deletion run) reveals all of it at once.
+  const [membersExpanded, setMembersExpanded] = React.useState(false);
+  // Selecting the group or one of its commits also spills the hidden members.
+  const selectGroup = () => { setMembersExpanded(true); onSelectGroup(); };
+  const selectMember = (id) => { setMembersExpanded(true); onSelectCommit(id); };
+  const { flaggedOverlay = {}, data } = useData();
   const meta = groupMeta(group.kind);
   const n = group.members.length;
   // Cap the inline member list at MAX_INLINE_MEMBERS, but never hide the commit
   // the auditor is currently parked on — if it lives past the cap, show the
   // whole list so its row stays visible (and scroll-into-view still lands).
+  // The auditor can also spill the rest inline via the "… N more events" row.
   const curIdx = currentCommitId ? group.members.findIndex((m) => m.id === currentCommitId) : -1;
-  const showAllMembers = curIdx >= MAX_INLINE_MEMBERS;
+  const showAllMembers = membersExpanded || curIdx >= MAX_INLINE_MEMBERS;
   const shownMembers = open
     ? (showAllMembers ? group.members : group.members.slice(0, MAX_INLINE_MEMBERS))
     : [];
   const hiddenCount = open && !showAllMembers ? Math.max(0, n - MAX_INLINE_MEMBERS) : 0;
+  // Offer a collapse affordance only when the auditor expanded it themselves —
+  // not when the cursor forced the full list (collapsing would hide that row).
+  const canCollapseMembers = open && membersExpanded && curIdx < MAX_INLINE_MEMBERS && n > MAX_INLINE_MEMBERS;
   const flagSummary = React.useMemo(() => groupFlagSummary(group.members), [group.members]);
   const cls = groupFileClass(group.members);
   const clsStyle = cls ? GROUP_CLASS_STYLE[cls] : null;
@@ -1312,7 +1434,7 @@ function GroupRow({ group, currentGroup, currentCommitId, currentRowRef, checkou
       }}
     >
       <div
-        onClick={onSelectGroup}
+        onClick={selectGroup}
         title={
           flagSummary
             ? `select group → cumulative diff · ${flagSummary.flaggedCount} of ${n} commits flagged`
@@ -1393,13 +1515,34 @@ function GroupRow({ group, currentGroup, currentCommitId, currentRowRef, checkou
         const isCur = m.id === currentCommitId;
         const isHead = checkout && checkout.lastSha && m.sha === checkout.lastSha;
         const mark = memberFlagMark(m);
+        // In a same-file run (e.g. a code commit group) every member touches the
+        // file already named in the header, so repeating its path per row is
+        // noise — lead with the annotation's short title instead. When a member
+        // has no per-commit short title, fall back to the whole-group annotation
+        // (the group-level note the dossier labels "whole group"), prefixed with
+        // the file so the row still names what it touched: "<file>: <annotation>".
+        // Applies to same-file edit runs and to creation/deletion sequences alike.
+        // Only when neither a short title nor a group annotation exists do we drop
+        // to the plain path.
+        const sameAsRoot = m.file && group.root && m.file === group.root;
+        const usesShortTitle = sameAsRoot && !!m.shortTitle;
+        const groupAnno = m.shortTitle ? '' : wholeGroupAnnotation(m, data?.annotationsByGroup);
+        const memberLabel = usesShortTitle
+          ? m.shortTitle
+          : groupAnno
+            ? `${basename(m.file) || '(file)'}: ${clipText(groupAnno, 80)}`
+            : (m.title || '(untitled)');
         return (
           <div
             key={m.id}
             ref={isCur ? currentRowRef : undefined}
             data-rowid={m.id}
-            onClick={() => onSelectCommit(m.id)}
-            title={mark ? `open this commit · ${mark.label}` : 'open this individual commit'}
+            onClick={() => selectMember(m.id)}
+            title={
+              usesShortTitle || groupAnno
+                ? `${anon(m.file)}${groupAnno ? ` · ${anon(groupAnno)}` : ''}${mark ? ` · ${mark.label}` : ''} — open this individual commit`
+                : (mark ? `open this commit · ${mark.label}` : 'open this individual commit')
+            }
             style={{
               display: 'grid',
               gridTemplateColumns: '56px 1fr auto auto',
@@ -1421,7 +1564,7 @@ function GroupRow({ group, currentGroup, currentCommitId, currentRowRef, checkou
               size={11}
               color={WF.ink3}
               style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-            >{anon(m.title || '(untitled)')}</L>
+            >{anon(memberLabel)}</L>
             {mark ? (
               <Chip
                 style={{ background: mark.bg, color: mark.fg, borderColor: mark.bg, alignSelf: 'center' }}
@@ -1435,8 +1578,8 @@ function GroupRow({ group, currentGroup, currentCommitId, currentRowRef, checkou
 
       {hiddenCount > 0 && (
         <div
-          onClick={onSelectGroup}
-          title={`${hiddenCount} more — open the group to see all ${n} commits and the full file tree`}
+          onClick={(e) => { e.stopPropagation(); setMembersExpanded(true); }}
+          title={`show all ${n} events in this group inline`}
           style={{
             padding: '3px 12px 5px 96px',
             cursor: 'pointer',
@@ -1445,8 +1588,23 @@ function GroupRow({ group, currentGroup, currentCommitId, currentRowRef, checkou
           }}
         >
           <L size={11} color={WF.ink3} weight={600}>
-            … {hiddenCount} more {hiddenCount === 1 ? 'commit' : 'commits'}
+            … {hiddenCount} more {hiddenCount === 1 ? 'event' : 'events'}
           </L>
+        </div>
+      )}
+
+      {canCollapseMembers && (
+        <div
+          onClick={(e) => { e.stopPropagation(); setMembersExpanded(false); }}
+          title={`collapse back to the first ${MAX_INLINE_MEMBERS} events`}
+          style={{
+            padding: '3px 12px 5px 96px',
+            cursor: 'pointer',
+            userSelect: 'none',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          <L size={11} color={WF.ink3} weight={600}>▴ show fewer</L>
         </div>
       )}
     </div>
@@ -1524,7 +1682,7 @@ function DataMergeRow({ item, onOpen }) {
       ))}
       {moreCount > 0 && (
         <div style={{ padding: '3px 12px 8px 76px', whiteSpace: 'nowrap' }}>
-          <L size={11} color={WF.ink3} weight={600}>… {moreCount} more {moreCount === 1 ? 'commit' : 'commits'}</L>
+          <L size={11} color={WF.ink3} weight={600}>… {moreCount} more {moreCount === 1 ? 'event' : 'events'}</L>
         </div>
       )}
     </div>
@@ -2068,7 +2226,7 @@ function GroupDossier({ group, onSelectCommit }) {
           <GroupValidatorNotes flagKey={flagKey} notes={groupNotes} flagged={userGroupFlagged} />
         </Tiles>
 
-        <CumulativeDiffPanel from={group.fromSha} to={group.toSha} />
+        <CumulativeDiffPanel from={group.fromSha} to={group.toSha} members={group.members} />
         {/* change-by-change progression hidden — groups show just the net change.
             Re-enable by restoring this and wrapping the cumulative diff in
             <CumulativeDiffPanel ... collapsible /> alongside it:
@@ -2080,15 +2238,106 @@ function GroupDossier({ group, onSelectCommit }) {
   );
 }
 
+// Net per-file changes a group produced, reconstructed from the sidecar member
+// metadata alone — the fallback for when git can't resolve the group's commits
+// (the reconstructed repo is absent, or its SHAs were never built, so
+// /api/groupdiff has nothing to diff). Each member already carries its path(s) +
+// change kind from the commit_sidecar.jsonl join in dataStore, so even without
+// the git patch we can still report *what* the group touched and its net effect.
+// Walks members oldest → newest, buckets by path (a coalesced commit expands to
+// one entry per touched file), then collapses each path's kind sequence to a net
+// verb the same way `git diff <from>~1 <to>` would net the range: a file created
+// and later deleted inside the group nets out (transient); otherwise a leading
+// CREATE ⇒ added, a trailing DELETE ⇒ removed, anything else ⇒ modified. Output
+// is sorted by path so it lists like the real cumulative diff.
+function netSidecarChanges(members) {
+  const map = new Map();
+  for (const m of members || []) {
+    for (const p of memberPaths(m)) {
+      if (!p) continue;
+      if (!map.has(p)) map.set(p, { path: p, kinds: [], member: m });
+      const b = map.get(p);
+      b.kinds.push(m.kind);
+      b.member = m; // latest member touching this path — its fileClass / id
+    }
+  }
+  return [...map.values()]
+    .map((b) => {
+      const born = b.kinds[0] === 'CREATE';
+      const died = b.kinds[b.kinds.length - 1] === 'DELETE';
+      const net = born && died ? 'transient' : born ? 'added' : died ? 'removed' : 'modified';
+      return { path: b.path, net, kinds: b.kinds, member: b.member };
+    })
+    .sort((a, b) => a.path.localeCompare(b.path));
+}
+
+// Net verb → the KIND_STYLE badge it borrows (transient has no net effect, so it
+// renders muted with the neutral SYNC chip).
+const NET_STYLE = {
+  added:     { kind: 'CREATE', label: 'added' },
+  removed:   { kind: 'DELETE', label: 'removed' },
+  modified:  { kind: 'MODIFY', label: 'modified' },
+  transient: { kind: null,     label: 'added then removed' },
+};
+
+// Sidecar-backed stand-in for the cumulative diff: shown when git can't load the
+// group's patch. Lists the net file changes recovered from the member sidecar
+// metadata (paths + change kind, no line-level bytes), with the raw git error
+// kept in a muted line so the failure is still diagnosable.
+function SidecarNetFallback({ netChanges, error }) {
+  const anon = useAnonymize();
+  return (
+    <div style={{ marginTop: 8 }}>
+      <L mono size={11} color={WF.heat4} style={{ display: 'block' }}>
+        couldn't load the diff from git — the group's commits aren't in the reconstructed repo
+      </L>
+      <L size={11} color={WF.ink2} style={{ display: 'block', marginTop: 6 }}>
+        Showing the net file changes recovered from the commit sidecar instead (paths + change kind, no line-level patch).
+      </L>
+      {netChanges.length === 0 ? (
+        <L mono size={11} color={WF.ink3} style={{ display: 'block', marginTop: 8 }}>
+          the sidecar lists no file changes for this group
+        </L>
+      ) : (
+        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column' }}>
+          {netChanges.map((c, i) => {
+            const ns = NET_STYLE[c.net];
+            const ks = ns.kind ? KIND_STYLE[ns.kind] : KIND_STYLE.SYNC;
+            const fc = c.member?.fileClass ? FILECLASS_STYLE[c.member.fileClass] : null;
+            const muted = c.net === 'transient';
+            return (
+              <div
+                key={`${c.path}:${i}`}
+                style={{ display: 'flex', alignItems: 'baseline', gap: 8, padding: '2px 4px', borderBottom: `1px solid ${WF.rule}`, opacity: muted ? 0.55 : 1 }}
+              >
+                <Chip style={{ background: ks.bg, color: ks.fg, borderColor: ks.fg }}>{ks.glyph} {ns.label}</Chip>
+                {fc && <Chip style={{ background: fc.bg, color: fc.fg, borderColor: fc.fg }} title={fc.title}>{fc.glyph}</Chip>}
+                <L mono size={11} color={muted ? WF.ink3 : WF.ink} style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{anon(c.path)}</L>
+                {c.kinds.length > 1 && <L mono size={10} color={WF.ink3}>· {c.kinds.length} edits</L>}
+              </div>
+            );
+          })}
+        </div>
+      )}
+      <L mono size={10} color={WF.ink3} style={{ display: 'block', marginTop: 8 }}>git: {error}</L>
+    </div>
+  );
+}
+
 // Cumulative patch across a group via /api/groupdiff (git diff <from>~1 <to>).
 // Reuses the single-commit parseDiff / DiffGroup renderers. After-images resolve
 // against the group tip `to`; before-images against the diff base `from~1` (not
-// `to~1`), so blobs deleted partway through the group still render.
-function CumulativeDiffPanel({ from, to, collapsible = false, defaultOpen = true }) {
+// `to~1`), so blobs deleted partway through the group still render. When git
+// can't resolve the commits, falls back to a sidecar-derived net file list
+// (SidecarNetFallback) built from `members` rather than just printing an error.
+function CumulativeDiffPanel({ from, to, members = [], collapsible = false, defaultOpen = true }) {
   const { selectedInput } = useData();
   const [open, setOpen] = React.useState(collapsible ? defaultOpen : true);
   const [state, setState] = React.useState({ status: 'loading', parsed: null, error: null });
   const runRef = React.useRef(0);
+  // Net change recovered from the sidecar member metadata — only rendered when
+  // the git diff fails, but memoized here so it's ready the moment it's needed.
+  const netChanges = React.useMemo(() => netSidecarChanges(members), [members]);
 
   const fetchDiff = React.useCallback(async () => {
     const run = ++runRef.current;
@@ -2131,7 +2380,7 @@ function CumulativeDiffPanel({ from, to, collapsible = false, defaultOpen = true
         <LoadingBox label="loading net diff" height={64} style={{ marginTop: 8 }} />
       )}
       {open && state.status === 'error' && (
-        <L mono size={11} color={WF.heat4} style={{ display: 'block', marginTop: 8 }}>error: {state.error}</L>
+        <SidecarNetFallback netChanges={netChanges} error={state.error} />
       )}
       {open && state.status === 'ready' && parsed && (
         <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 18 }}>
@@ -2422,6 +2671,35 @@ function FileEditStep({ member, file, index, total, onSelectCommit }) {
   );
 }
 
+// Center-pane placeholder shown before any commit is selected — the clean slate
+// a freshly opened trace lands on. Points the auditor at the two ways in.
+function EmptyDossier() {
+  const key = {
+    display: 'inline-block',
+    minWidth: 18,
+    padding: '1px 6px',
+    border: inkBorder(1.2),
+    borderRadius: 3,
+    background: WF.paperAlt,
+    fontFamily: WF.monoFont,
+    fontSize: 12,
+    lineHeight: 1.4,
+  };
+  return (
+    <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 40, minWidth: 0 }}>
+      <div style={{ textAlign: 'center', maxWidth: 380 }}>
+        <L size={15} weight={700} color={WF.ink2} style={{ display: 'block', marginBottom: 10 }}>
+          no commit selected
+        </L>
+        <L size={12.5} color={WF.ink3} style={{ display: 'block', lineHeight: 1.7 }}>
+          press <span style={key}>↓</span> to open the first commit, or click any row in the
+          timeline to start.
+        </L>
+      </div>
+    </div>
+  );
+}
+
 function DossierBody({ chunk, byId, checkedOut, pendingCheckout, checkoutEnabled, onCheckout, onNavigate }) {
   const { toggleDismiss, toggleFlag, currentTrace, showAiSuspicion } = useData();
   const { showAuditEventBox } = useSettings();
@@ -2601,8 +2879,8 @@ const FILELOG_STATUS = {
   C: { glyph: '⎘', color: WF.tagBlueFg, label: 'copied' },
 };
 
-function FileTimeline({ chunk, byId, onNavigate, width = 256 }) {
-  const { selectedInput } = useData();
+function FileTimeline({ chunk, byId, onNavigate, width = 256, showNotes = true }) {
+  const { selectedInput, data } = useData();
   const { paneWidths, setPaneWidth, inboxTitleFromShortTitle } = useSettings();
   const anon = useAnonymize();
   const file = chunk.file;
@@ -2650,6 +2928,27 @@ function FileTimeline({ chunk, byId, onNavigate, width = 256 }) {
 
   const currentIdx = state.entries.findIndex((e) => e.sha === chunk.sha);
 
+  // Center the open commit within the scrollable follow history. A long
+  // file_continuation chain makes this column scroll, and the "you are here"
+  // node usually sits mid-chain, so on open it would otherwise land off-screen
+  // (pinned to the top or bottom). Re-run once the chain is ready and again when
+  // the open commit changes — same-file navigation keeps state 'ready' and only
+  // moves the marker, so depend on chunk.sha too. Done by nudging this
+  // container's own scrollTop (not scrollIntoView) so it never tugs the
+  // surrounding dossier panes, in a layout effect so it lands before paint.
+  const scrollRef = React.useRef(null);
+  React.useLayoutEffect(() => {
+    if (state.status !== 'ready') return;
+    const c = scrollRef.current;
+    if (!c) return;
+    const node = c.querySelector('[data-current="true"]');
+    if (!node) return;
+    const cRect = c.getBoundingClientRect();
+    const nRect = node.getBoundingClientRect();
+    const delta = (nRect.top - cRect.top) - (c.clientHeight - nRect.height) / 2;
+    c.scrollTop = Math.max(0, c.scrollTop + delta);
+  }, [state.status, chunk.sha]);
+
   return (
     <div style={{ width, flexShrink: 0, display: 'flex', flexDirection: 'column', minHeight: 0, background: WF.paper }}>
       <div style={{ padding: '10px 12px', borderBottom: inkBorder() }}>
@@ -2675,7 +2974,7 @@ function FileTimeline({ chunk, byId, onNavigate, width = 256 }) {
           header; a vertical resizer between them lets the auditor trade list
           height for note-taking room. */}
       <div ref={sharedRef} style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-        <div style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: '8px 0' }}>
+        <div ref={scrollRef} style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: '8px 0' }}>
           {!file && <TimelineEmpty text="this event doesn't touch a tracked file (bash / session / sync)" />}
           {file && state.status === 'loading' && <LoadingBox label="loading file history" height={64} style={{ margin: '8px 0' }} />}
           {file && state.status === 'error' && <TimelineEmpty text={`error: ${state.error}`} tone="error" />}
@@ -2691,8 +2990,14 @@ function FileTimeline({ chunk, byId, onNavigate, width = 256 }) {
               : null;
             // The annotation headline lives on the matching event, reachable via
             // the same sha → id → chunk hop the jump-to navigation uses; '' when
-            // the commit has no event record or no annotation.
-            const shortTitle = byId[idBySha[e.sha]]?.shortTitle || '';
+            // the commit has no event record or no annotation. When the commit
+            // has no per-commit short title but belongs to a code-commit group
+            // with a whole-group annotation, fall back to that annotation (this
+            // also covers create commits, whose own short title is often empty).
+            const entryChunk = byId[idBySha[e.sha]];
+            const shortTitle = entryChunk?.shortTitle
+              || wholeGroupAnnotation(entryChunk, data?.annotationsByGroup)
+              || '';
             return (
               <React.Fragment key={e.sha + ':' + i}>
                 {gap > 0 && <SpineGap n={gap} />}
@@ -2712,25 +3017,30 @@ function FileTimeline({ chunk, byId, onNavigate, width = 256 }) {
         </div>
         {/* Handle sits on the notes box's top (leading) edge, so dragging up
             grows the notes → dir = -1. The resizer draws its own divider line,
-            so the notes box below carries no top border. */}
-        <PaneResizer
-          axis="y"
-          dir={-1}
-          width={paneWidths.dossierNotes}
-          setWidth={(h) => setPaneWidth('dossierNotes', h)}
-          min={88}
-          max={notesMax}
-          dflt={PANE_DEFAULTS.dossierNotes}
-        />
+            so the notes box below carries no top border. Hidden when the rail is
+            showing a group's file history — GroupDossier owns the group notes. */}
+        {showNotes && (
+          <PaneResizer
+            axis="y"
+            dir={-1}
+            width={paneWidths.dossierNotes}
+            setWidth={(h) => setPaneWidth('dossierNotes', h)}
+            min={88}
+            max={notesMax}
+            dflt={PANE_DEFAULTS.dossierNotes}
+          />
+        )}
         {/* Validator notes share this rail, anchored below the file timeline so
             the auditor's annotations sit alongside the file's history rather than
             buried at the bottom of the dossier scroll. */}
-        <div style={{ flex: 'none', height: paneWidths.dossierNotes, maxHeight: '60%', padding: '10px 12px', overflow: 'auto', background: WF.paper }}>
-          <L size={12} weight={600}>validator notes (you)</L>
-          <div style={{ marginTop: 8 }}>
-            <ValidatorNotesEditor chunkId={chunk.id} notes={chunk.userNotes} />
+        {showNotes && (
+          <div style={{ flex: 'none', height: paneWidths.dossierNotes, maxHeight: '60%', padding: '10px 12px', overflow: 'auto', background: WF.paper }}>
+            <L size={12} weight={600}>validator notes (you)</L>
+            <div style={{ marginTop: 8 }}>
+              <ValidatorNotesEditor chunkId={chunk.id} notes={chunk.userNotes} />
+            </div>
           </div>
-        </div>
+        )}
       </div>
     </div>
   );
@@ -2749,6 +3059,7 @@ function TimelineNode({ entry, shortTitle, titleFromShortTitle, isCurrent, isFir
   const label = anon(useShort ? shortTitle : (entry.subject || '(no message)'));
   return (
     <div
+      data-current={isCurrent ? 'true' : undefined}
       onClick={clickable ? () => onNavigate(targetId) : undefined}
       title={
         isCurrent ? 'current commit'
@@ -2885,14 +3196,13 @@ function SuspicionsPanel({ suspicions, agg, byId, currentId, onNavigate, dismiss
   const borderColor = dismissed ? WF.rule2 : style.bg;
   const background = dismissed ? WF.paperAlt : WF.tint;
   // The level + category already lead each SuspicionDetail, so the panel no
-  // longer stacks a header above them. Its group-level bits (agreement count,
-  // dismissed state, dismiss toggle) ride the right edge of the FIRST detail's
-  // chip row instead — so the dismiss button stays in line and never pushes the
-  // content down. A lone suspicion renders that chip row at the old header's
-  // title size so the box doesn't read as lopsided.
-  const controls = ((agg?.agreement_count > 1) || dismissed || onDismiss) ? (
+  // longer stacks a header above them. Its group-level bits (dismissed state,
+  // dismiss toggle) ride the right edge of the FIRST detail's chip row instead
+  // — so the dismiss button stays in line and never pushes the content down. A
+  // lone suspicion renders that chip row at the old header's title size so the
+  // box doesn't read as lopsided.
+  const controls = (dismissed || onDismiss) ? (
     <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-      {agg?.agreement_count > 1 && <Chip>{agg.agreement_count} agents agree</Chip>}
       {dismissed && <Chip bg={WF.paperAlt} color={WF.ink2}>dismissed</Chip>}
       {onDismiss && (
         <Chip
@@ -2933,7 +3243,7 @@ export function SuspicionDetail({ s, byId, currentId, onNavigate, dimmed, promin
   const accent = dimmed ? WF.heat2 : lvl.bg;
   // `prominent` marks the sole suspicion in a panel: its chip row stands in for
   // the header that used to sit above it, so size the chips up to that old title.
-  // `headerExtra` (the panel's dismiss/agreement controls) rides the right edge
+  // `headerExtra` (the panel's dismiss controls) rides the right edge
   // of this same row so it stays in line rather than pushing content down.
   const titleChip = prominent ? { fontSize: 13, padding: '3px 8px' } : undefined;
   return (
@@ -3043,13 +3353,16 @@ function AnnotationItem({ a, sourceLabel, onClick }) {
 // Commit dossier: the descriptions attached to this one commit.
 function AnnotationsPanel({ annotations, style }) {
   if (!annotations || annotations.length === 0) return null;
+  // When several annotation agents describe the same commit, show just one
+  // "what's being done" — the first alphabetically (by annotation text, then
+  // short_title for a stable tie break) — rather than stacking a box per agent.
+  const annoSortKey = (a) => `${a?.annotation || ''} ${a?.short_title || ''}`.toLowerCase();
+  const first = [...annotations].sort((a, b) => annoSortKey(a).localeCompare(annoSortKey(b)))[0];
   return (
     <Box style={{ padding: 10, borderColor: WF.ink3, background: WF.panel, ...style }}>
       <L size={12} weight={700} color={WF.ink2}>📝 what's being done</L>
       <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 8 }}>
-        {annotations.map((a, i) => (
-          <AnnotationItem key={a.annotation_id || i} a={a} />
-        ))}
+        <AnnotationItem a={first} />
       </div>
     </Box>
   );
@@ -3141,29 +3454,41 @@ function GroupValidatorNotes({ flagKey, notes, flagged, style }) {
 // Group dossier: pull the group-level annotation AND every member commit's
 // annotation into the group report, each tagged with which commit it came
 // from (flagged members get a 🚩). Clicking a member annotation opens it.
+const MAX_INLINE_ANNOS = 4;
 function GroupAnnotations({ group, onSelectCommit, style }) {
   const { data } = useData();
   const { showCommitHashes } = useSettings();
+  const [expanded, setExpanded] = React.useState(false);
   const groupAnnos = (data?.annotationsByGroup && data.annotationsByGroup[group.id]) || [];
   const memberAnnos = [];
   for (const m of group.members || []) {
     for (const a of (m.annotations || [])) memberAnnos.push({ a, member: m });
   }
   if (groupAnnos.length === 0 && memberAnnos.length === 0) return null;
+  // Cap the combined list (group-level + member) at MAX_INLINE_ANNOS, filling
+  // group annotations first, then member ones; the rest fold into a clickable
+  // "… N more annotations" row that spills the whole list inline.
+  const total = groupAnnos.length + memberAnnos.length;
+  const capped = !expanded && total > MAX_INLINE_ANNOS;
+  const shownGroup = capped ? groupAnnos.slice(0, MAX_INLINE_ANNOS) : groupAnnos;
+  const shownMembers = capped
+    ? memberAnnos.slice(0, Math.max(0, MAX_INLINE_ANNOS - shownGroup.length))
+    : memberAnnos;
+  const hiddenCount = total - (shownGroup.length + shownMembers.length);
   return (
     <Box style={{ padding: 10, borderColor: WF.ink3, background: WF.panel, ...style }}>
       <L size={12} weight={700} color={WF.ink2}>📝 annotations in this group</L>
-      {groupAnnos.length > 0 && (
+      {shownGroup.length > 0 && (
         <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {groupAnnos.map((a, i) => (
+          {shownGroup.map((a, i) => (
             <AnnotationItem key={a.annotation_id || i} a={a} sourceLabel="whole group" />
           ))}
         </div>
       )}
-      {memberAnnos.length > 0 && (
-        <div style={{ marginTop: groupAnnos.length ? 10 : 6, display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {shownMembers.length > 0 && (
+        <div style={{ marginTop: shownGroup.length ? 10 : 6, display: 'flex', flexDirection: 'column', gap: 8 }}>
           <L mono size={10} color={WF.ink3}>from member commits</L>
-          {memberAnnos.map(({ a, member }, i) => (
+          {shownMembers.map(({ a, member }, i) => (
             <AnnotationItem
               key={a.annotation_id || i}
               a={a}
@@ -3171,6 +3496,26 @@ function GroupAnnotations({ group, onSelectCommit, style }) {
               onClick={() => onSelectCommit(member.id)}
             />
           ))}
+        </div>
+      )}
+      {hiddenCount > 0 && (
+        <div
+          onClick={() => setExpanded(true)}
+          title={`show all ${total} annotations in this group`}
+          style={{ marginTop: 8, cursor: 'pointer', userSelect: 'none' }}
+        >
+          <L size={11} color={WF.ink3} weight={600}>
+            … {hiddenCount} more annotation{hiddenCount === 1 ? '' : 's'}
+          </L>
+        </div>
+      )}
+      {expanded && total > MAX_INLINE_ANNOS && (
+        <div
+          onClick={() => setExpanded(false)}
+          title={`collapse back to the first ${MAX_INLINE_ANNOS}`}
+          style={{ marginTop: 8, cursor: 'pointer', userSelect: 'none' }}
+        >
+          <L size={11} color={WF.ink3} weight={600}>▴ show fewer</L>
         </div>
       )}
     </Box>
@@ -3253,7 +3598,10 @@ function PaneOutputBox({ diff, panePath, sha }) {
       } catch { if (alive) setLazyStatus('error'); }
     })();
     return () => { alive = false; };
-  }, [file, lazyBody, lazyStatus, sha, selectedInput]);
+    // deps omit lazyBody/lazyStatus on purpose: setting status to 'loading' below
+    // must not re-run this effect, or run #2's cleanup cancels run #1's in-flight
+    // fetch and the guard's `=== 'idle'` then strands it on "loading" forever.
+  }, [file, sha, selectedInput]); // eslint-disable-line react-hooks/exhaustive-deps
   const effBody = lazyBody != null ? lazyBody : (file ? file.body : []);
   // Only the changed (+/−) lines — pane logs are append-heavy, so the diff reads
   // as mostly green; same treatment as the git-diff box's log-file rows.
@@ -3445,22 +3793,31 @@ export function CommitHeader({ text }) {
 // or a commit touching hundreds of files can produce tens of thousands of DOM
 // nodes and freeze (or crash) the tab. Past these thresholds we collapse to a
 // preview / file list and let the auditor opt into the full render per file.
-export const BIG_FILE_LINES = 200;  // hunk-body lines before a single file is previewed
-export const PREVIEW_LINES = 30;    // lines shown up front for a big file
+export const BIG_FILE_LINES = 350;       // data artifacts: hunk-body lines before a file is treated as big
+export const BIG_FILE_LINES_CODE = 500;  // authored source / prose: a higher bar — code is read in longer stretches
+export const PREVIEW_LINES = 30;    // lines shown up front for a big data file
 const MANY_FILES = 15;       // files in one diff before they render as a list
 const TOTAL_LINES = 1200;    // summed hunk-body lines before files render as a list
+
+// The "big" threshold is per-file: produced artifacts (.json/.jsonl/.csv/.log,
+// images, binaries — deriveFileClass === 'data') collapse early at 350 lines,
+// while authored source and prose (code + .md / extensionless, i.e. non-data)
+// only count as big past 500. A big data file falls back to the 30-line preview;
+// a big source file is instead shown clipped (see FileDiff).
+export const bigLinesFor = (path) =>
+  deriveFileClass(path) === 'data' ? BIG_FILE_LINES : BIG_FILE_LINES_CODE;
 
 // ── Lazy diff loading ──────────────────────────────────────────────────────
 // Rather than pull a commit's whole `git show` patch (which for a merged
 // .log/.jsonl commit can be megabytes) the diff panels do two cheap passes:
 //   1. /api/diffstat → every file's path + added/deleted counts (numstat), no
-//      bodies. Files over LARGE_DIFF_LINES changed lines stay collapsed.
+//      bodies. Files over their per-class big threshold (bigLinesFor) stay
+//      collapsed — data artifacts at 350 changed lines, source/prose at 500.
 //   2. /api/diff?paths=… → the bodies of just the small files, in one git call.
 // A large file's body is fetched only if the auditor opens it (FileDiff /
 // LogDiffRow load it on demand via /api/filediff). mergeStatBodies rebuilds the
 // exact {commitMessage, logs, other} shape parseDiff returns, so every renderer
 // is unchanged save for honoring `large`/`loaded` on each file.
-const LARGE_DIFF_LINES = BIG_FILE_LINES; // changed lines (added+deleted) past which a file stays collapsed
 
 // new- / old-path for a numstat rename token: `a => b`, or the brace form
 // `dir/{a => b}/f`. Plain paths pass straight through.
@@ -3520,7 +3877,7 @@ function mergeStatBodies(stat, bodyByPath) {
     if (s.isNew) meta.push('new file mode 100644');
     if (s.isDeleted) meta.push('deleted file mode 100644');
     if (s.isRename && s.renameFrom) { meta.push(`rename from ${s.renameFrom}`); meta.push(`rename to ${s.path}`); }
-    const big = !s.isBinary && statTotal(s) > LARGE_DIFF_LINES;
+    const big = !s.isBinary && statTotal(s) > bigLinesFor(s.path);
     if (big) {
       return { path: s.path, meta, body: [], isBinary: false, added: s.added ?? 0, deleted: s.deleted ?? 0, large: true, loaded: false };
     }
@@ -3547,7 +3904,7 @@ async function fetchDiffText(url) {
 // Bodies of the small files only, via one batched /api/diff (or /api/groupdiff)
 // restricted to their paths. `bodyUrl` already carries the sha/range + name.
 async function fetchSmallBodies(stat, bodyUrl) {
-  const small = stat.files.filter((s) => !s.isBinary && statTotal(s) <= LARGE_DIFF_LINES);
+  const small = stat.files.filter((s) => !s.isBinary && statTotal(s) <= bigLinesFor(s.path));
   const byPath = new Map();
   if (!small.length) return byPath;
   const paths = encodeURIComponent(small.map((s) => s.path).join('\n'));
@@ -3725,7 +4082,10 @@ function LogDiffRow({ file, first, border, isPane, sha, oldSha }) {
       } catch { if (alive) setLazyStatus('error'); }
     })();
     return () => { alive = false; };
-  }, [wantBody, file.loaded, lazyBody, lazyStatus, file.isBinary, file.path, sha, oldSha, selectedInput]);
+    // deps omit lazyBody/lazyStatus on purpose: setting status to 'loading' below
+    // must not re-run this effect, or run #2's cleanup cancels run #1's in-flight
+    // fetch and the guard's `=== 'idle'` then strands it on "loading" forever.
+  }, [wantBody, file.loaded, file.isBinary, file.path, sha, oldSha, selectedInput]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const loaded = file.loaded !== false || lazyBody != null;
   const effectiveBody = lazyBody != null ? lazyBody : file.body;
@@ -4100,7 +4460,13 @@ export function FileDiff({ file, sha, oldSha, collapsible = false, open = false,
   const reset = () => { armAnchor('down'); setUpIdx(null); setDownIdx(null); setExpandedGaps(new Set()); };
 
   const bodyLines = activeBody.length;
-  const isBig = !isImage && !file.isBinary && bodyLines > BIG_FILE_LINES;
+  // Produced artifacts (json/jsonl/csv/log, …) get the cheap 30-line preview when
+  // big; authored source and prose (non-data) are instead shown clipped — read
+  // top-down, bottom clipped, with the directional expand controls — and only
+  // count as big past the higher source threshold (bigLinesFor).
+  const isData = deriveFileClass(file.path) === 'data';
+  const isBig = !isImage && !file.isBinary && bodyLines > bigLinesFor(file.path);
+  const dataPreview = isBig && !full && isData;
   const showBody = hideHeader || (collapsible ? open : true);
   // Fetch a `large` file's body the first time it's opened (its patch was held
   // back from the batch load). One file's diff at the committed ±3 context, via
@@ -4125,7 +4491,10 @@ export function FileDiff({ file, sha, oldSha, collapsible = false, open = false,
       }
     })();
     return () => { alive = false; };
-  }, [showBody, file.loaded, lazyBody, lazyStatus, sha, oldSha, file.path, selectedInput, isImage, file.isBinary]);
+    // deps omit lazyBody/lazyStatus on purpose: setting status to 'loading' below
+    // must not re-run this effect, or run #2's cleanup cancels run #1's in-flight
+    // fetch and the guard's `=== 'idle'` then strands it on "loading" forever.
+  }, [showBody, file.loaded, sha, oldSha, file.path, selectedInput, isImage, file.isBinary]); // eslint-disable-line react-hooks/exhaustive-deps
   // A new file with no hunk body is an empty (0-byte) file — git emits the
   // `new file mode` header but no `+` lines. Flag it so we can say so explicitly
   // instead of leaving a bare header with nothing under it. Only once loaded —
@@ -4149,7 +4518,7 @@ export function FileDiff({ file, sha, oldSha, collapsible = false, open = false,
     ) :
     isImage ? (
       <ImageDiff sha={sha} oldSha={oldSha} path={file.path} hasOld={!isNew} hasNew={!isDeleted} />
-    ) : isBig && !full ? (
+    ) : dataPreview ? (
       <>
         <ColoredDiffBody lines={activeBody.slice(0, PREVIEW_LINES)} maxHeight={null} lineNumbers={showLineNumbers} />
         <div
@@ -4183,17 +4552,44 @@ export function FileDiff({ file, sha, oldSha, collapsible = false, open = false,
           )}
           <ColoredDiffBody
             lines={renderLines}
-            maxHeight={expandActive || gapsActive ? null : 960}
+            // Big source/prose files are shown clipped (top-anchored, so the head
+            // is visible and the tail is clipped below); `full` lifts the cap. Big
+            // data files that opted into the full diff keep their 960 scroll cap.
+            maxHeight={(full && !isData) || expandActive || gapsActive ? null : 960}
             lineNumbers={showLineNumbers}
             gapAt={gapAt}
             onExpandGap={expandGap}
           />
-          {canExpand && (
+          {canExpand ? (
             <ExpandBar
               dir="down" idx={downIdx} lines={downLines}
               status={fetched.status} error={fetched.error}
               onMore={bumpDown} onReset={expandActive || gapsActive ? reset : null}
             />
+          ) : isBig && !isData && (
+            // New / deleted whole-file source diffs have no surrounding context to
+            // fetch (canExpand is false), so the up/down context bars never show.
+            // Give them their own bottom control: the body is clipped to the top by
+            // default and this reveals the rest below — adding to the end of a file
+            // reads head-first this way.
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                padding: '8px 10px',
+                background: WF.paperAlt,
+                borderTop: `1px solid ${WF.rule}`,
+              }}
+            >
+              <L mono size={11} color={WF.ink3}>
+                {full ? `${bodyLines} lines` : `${bodyLines} lines — clipped to the top`}
+              </L>
+              <div style={{ flex: 1 }} />
+              <Chip style={{ cursor: 'pointer' }} onClick={(e) => { e.stopPropagation(); setFull((v) => !v); }}>
+                {full ? '↑ clip' : '↓ expand below'}
+              </Chip>
+            </div>
           )}
         </>
       )
