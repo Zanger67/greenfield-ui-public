@@ -399,6 +399,75 @@ async function commitOrder(repo) {
   return map;
 }
 
+// Per-repo index of path-level rename/delete events across all history. Used to
+// follow a file's identity *forward* through renames: git's own `--follow`
+// only traces renames backward from the seed name, so seeding it with a
+// pre-rename name truncates the chain at the rename (post-rename commits never
+// appear). History is immutable for the dev server's life, so cache per repo.
+// Each event: { ord, type:'R', from, to, oldSha } or { ord, type:'D', path }.
+const pathEventsCache = new Map();
+async function pathEvents(repo) {
+  if (pathEventsCache.has(repo)) return pathEventsCache.get(repo);
+  const order = await commitOrder(repo);
+  const { code, stdout } = await runGit(repo, [
+    '-c', 'core.quotePath=false',
+    'log', '--all', '--diff-filter=RD', '--raw', '-M', '--abbrev=40',
+    '--format=%x00%H',
+  ]);
+  const events = [];
+  if (code === 0) {
+    for (const rec of stdout.split('\0')) {
+      const block = rec.replace(/^\n+/, '');
+      if (!block.trim()) continue;
+      const nl = block.indexOf('\n');
+      const h = (nl < 0 ? block : block.slice(0, nl)).trim();
+      if (!SHA_RE.test(h)) continue;
+      const ord = order.has(h) ? order.get(h) : null;
+      const rest = nl < 0 ? '' : block.slice(nl + 1);
+      for (const line of rest.split('\n')) {
+        if (!line.startsWith(':')) continue;
+        const segs = line.replace(/^:/, '').split('\t');
+        const meta = segs[0].split(/\s+/);            // [om,nm,osha,nsha,STATUS]
+        const status = (meta[4] || '').charAt(0);
+        if (status === 'R') {
+          events.push({ ord, type: 'R', from: segs[1], to: segs[2], oldSha: meta[2] || '' });
+        } else if (status === 'D') {
+          events.push({ ord, type: 'D', path: segs[1] });
+        }
+      }
+    }
+  }
+  pathEventsCache.set(repo, events);
+  return events;
+}
+
+// Walk a file's identity forward from `startPath` (its name at commit `sha`)
+// through any later renames, returning the name it carries at the newest commit
+// of its lineage. Seeding `git log --follow` with this latest name yields the
+// whole chain (both before and after every rename); seeding with a pre-rename
+// name truncates it at the rename. Stops if the file is deleted before a
+// same-name rename — a delete then an unrelated file reusing the name is a
+// different lineage, not a continuation of ours.
+async function latestPath(repo, sha, startPath) {
+  const order = await commitOrder(repo);
+  let shaOrd = order.has(sha) ? order.get(sha) : null;
+  if (shaOrd == null) {
+    for (const [k, v] of order) { if (k.startsWith(sha)) { shaOrd = v; break; } }
+  }
+  if (shaOrd == null) return startPath;               // unknown commit: don't guess
+  // Events strictly newer than `sha` (ord < shaOrd; 0 = newest), oldest-first
+  // (descending ord) so each rename chains off the prior one.
+  const newer = (await pathEvents(repo))
+    .filter((e) => e.ord != null && e.ord < shaOrd)
+    .sort((a, b) => b.ord - a.ord);
+  let current = startPath;
+  for (const e of newer) {
+    if (e.type === 'D') { if (e.path === current) break; continue; }
+    if (e.from === current && e.oldSha !== EMPTY_BLOB) current = e.to;
+  }
+  return current;
+}
+
 function checkoutMiddleware() {
   // Captured from the resolved config so the build hook knows where dist is.
   let buildOutDir = null;
@@ -801,7 +870,16 @@ function checkoutMiddleware() {
       // rename — recording that commit as the file's creation. With no genuine
       // renames present this yields exactly the plain-log result; when a real
       // rename appears (non-empty source) it is followed normally.
-      // `sha` only resolves the (experiment-relative) path against a tree.
+      //
+      // `--follow` only traces renames *backward* from the name it is seeded
+      // with, so seeding it with the path as it exists at `sha` truncates the
+      // chain whenever `sha` sits before a rename: the post-rename commits live
+      // under a name `--follow` never reaches from the old one. So we first walk
+      // the file's identity forward (`latestPath`) to the name it carries at the
+      // newest commit of its lineage and seed the follow with *that* — yielding
+      // the full chain regardless of which side of a rename `sha` is on.
+      // `sha` only resolves the (experiment-relative) path against a tree and
+      // anchors the forward walk.
       server.middlewares.use('/api/filelog', async (req, res) => {
         const url = new URL(req.url, 'http://x');
         const sha = url.searchParams.get('sha') || '';
@@ -817,6 +895,10 @@ function checkoutMiddleware() {
           res.statusCode = 409;
           return res.end(JSON.stringify({ error: 'ambiguous path', matches: resolved.matches }));
         }
+        // Follow forward to the lineage's newest name so `--follow` (which only
+        // traces renames backward) sees the whole chain, not just the part on
+        // `sha`'s side of a rename.
+        const followPath = await latestPath(repo, sha, resolved.path);
         // \x00 separates commits; \x1f separates header fields. `--raw -M`
         // appends one `:<modes> <oldsha> <newsha> <STATUS>\t<path>[\t<newpath>]`
         // line per file change, giving us the blob OIDs the guard needs.
@@ -824,7 +906,7 @@ function checkoutMiddleware() {
           '-c', 'core.quotePath=false',
           'log', '--all', '--follow', '--raw', '-M', '--abbrev=40',
           '--format=%x00%H%x1f%cI%x1f%s',
-          '--', resolved.path,
+          '--', followPath,
         ]);
         if (code !== 0) {
           res.statusCode = 500;
@@ -864,7 +946,7 @@ function checkoutMiddleware() {
           }
           entries.push({ sha: h, date, subject, status, from: fromPath, ord });
         }
-        res.end(JSON.stringify({ path: resolved.path, entries }));
+        res.end(JSON.stringify({ path: followPath, entries }));
       });
     },
   };
