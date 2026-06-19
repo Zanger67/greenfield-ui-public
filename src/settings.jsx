@@ -342,7 +342,10 @@ export function SettingsButton() {
             top: 30,
             right: 0,
             zIndex: 1100,
-            minWidth: 220,
+            // 50% wider than the old 220 single-column popover. The extra width
+            // pays for the two-column grid the display toggles flow into below,
+            // which roughly halves the popover's height — it was getting long.
+            minWidth: 330,
             padding: '10px 12px',
             background: WF.paper,
             border: inkBorder(1.5),
@@ -352,53 +355,47 @@ export function SettingsButton() {
           <L mono size={10} color={WF.ink3} style={{ display: 'block', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>
             display
           </L>
-          <ToggleRow
-            label="show times & dates"
-            hint="edit / log-item timestamps"
-            checked={showTimestamps}
-            onChange={(v) => setSetting('showTimestamps', v)}
-          />
-          <div style={{ marginTop: 12 }}>
+          {/* Two-column grid so the display toggles fill the wider popover and
+              the panel stays short. `alignItems: start` keeps each row anchored
+              to the top of its grid cell so a taller neighbour (wrapped hint /
+              the multi-button select) doesn't stretch its partner. */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', columnGap: 16, rowGap: 12, alignItems: 'start' }}>
+            <ToggleRow
+              label="show times & dates"
+              hint="edit / log-item timestamps"
+              checked={showTimestamps}
+              onChange={(v) => setSetting('showTimestamps', v)}
+            />
             <ToggleRow
               label="show commit hashes"
               hint="short SHAs on rows / headers"
               checked={showCommitHashes}
               onChange={(v) => setSetting('showCommitHashes', v)}
             />
-          </div>
-          <div style={{ marginTop: 12 }}>
             <ToggleRow
               label="show line numbers"
               hint="old / new gutter on source diffs"
               checked={showLineNumbers}
               onChange={(v) => setSetting('showLineNumbers', v)}
             />
-          </div>
-          <div style={{ marginTop: 12 }}>
             <ToggleRow
               label="show audit event box"
               hint="raw audit-event payload on file-edit dossiers"
               checked={showAuditEventBox}
               onChange={(v) => setSetting('showAuditEventBox', v)}
             />
-          </div>
-          <div style={{ marginTop: 12 }}>
             <ToggleRow
               label="show deterministic flags"
               hint="chunker pre-flags (add-then-remove, run-scrapped)"
               checked={showDeterministicFlags}
               onChange={(v) => setSetting('showDeterministicFlags', v)}
             />
-          </div>
-          <div style={{ marginTop: 12 }}>
             <ToggleRow
               label="show suspicion in overview"
               hint="AI pre-flag sections on the output view (needs AI flags on)"
               checked={showOverviewSuspicion}
               onChange={(v) => setSetting('showOverviewSuspicion', v)}
             />
-          </div>
-          <div style={{ marginTop: 12 }}>
             <SelectRow
               label="inbox subline"
               hint="greyed line under each row"
@@ -406,24 +403,18 @@ export function SettingsButton() {
               options={INBOX_SUBLINE_OPTIONS}
               onChange={(v) => setSetting('inboxSubline', v)}
             />
-          </div>
-          <div style={{ marginTop: 12 }}>
             <ToggleRow
               label="title from short title"
               hint="use the annotation headline as the row title when present"
               checked={inboxTitleFromShortTitle}
               onChange={(v) => setSetting('inboxTitleFromShortTitle', v)}
             />
-          </div>
-          <div style={{ marginTop: 12 }}>
             <ToggleRow
               label="merge data-op streams"
               hint='collapse long runs of data writes into one "many data file modifications" cell'
               checked={mergeDataOps}
               onChange={(v) => setSetting('mergeDataOps', v)}
             />
-          </div>
-          <div style={{ marginTop: 12 }}>
             <ToggleRow
               label="tag-flags hint"
               hint='show "adding a tag flags this …" under tag editors'

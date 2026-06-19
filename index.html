@@ -84,6 +84,11 @@
         --wf-tag-purple-bg: #eae6f4; --wf-tag-purple-fg: #3d2d70;
         --wf-tag-blue-bg: #dceaf2;   --wf-tag-blue-fg: #1f4d70;
         --wf-tag-slate-bg: #eceff1;  --wf-tag-slate-fg: #37474f;
+        /* diff-pane line *text*. Light mode keeps the current tag-green/heat4
+           colors (these mirror them); only dark mode shifts whiter — see the
+           dark block. The line highlight (the -bg fills above) is unchanged. */
+        --wf-diff-add-fg: #1c5a25;
+        --wf-diff-del-fg: #b8321a;
         /* categorical semantic-area accents (THEME_COLOR) */
         --wf-cat-data: #1e5631;
         --wf-cat-blue: #1f3d7a;
@@ -132,6 +137,9 @@
         --wf-tag-purple-bg: #272138; --wf-tag-purple-fg: #b29ae6;
         --wf-tag-blue-bg: #1c2a36;   --wf-tag-blue-fg: #7bb0df;
         --wf-tag-slate-bg: #2a2b26;  --wf-tag-slate-fg: #9aabb3;
+        /* diff-pane line text — slightly whiter than tag-green-fg/heat4 */
+        --wf-diff-add-fg: #d5efdc;
+        --wf-diff-del-fg: #efcec5;
         --wf-cat-data: #2f7d4a;
         --wf-cat-blue: #3f64b0;
         --wf-cat-purple: #6b4bb0;

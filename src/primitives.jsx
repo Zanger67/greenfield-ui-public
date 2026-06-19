@@ -64,6 +64,9 @@ export const WF = {
   tagPurpleBg: 'var(--wf-tag-purple-bg)', tagPurpleFg: 'var(--wf-tag-purple-fg)',
   tagBlueBg: 'var(--wf-tag-blue-bg)',     tagBlueFg: 'var(--wf-tag-blue-fg)',
   tagSlateBg: 'var(--wf-tag-slate-bg)',   tagSlateFg: 'var(--wf-tag-slate-fg)',
+  // Diff-pane line *text* — mirrors tagGreenFg/heat4 in light mode, shifts
+  // whiter in dark. Backgrounds stay tagGreenBg/tagRedBg. Used by ColoredDiffBody.
+  diffAddFg: 'var(--wf-diff-add-fg)',     diffDelFg: 'var(--wf-diff-del-fg)',
   // Categorical semantic-area accents (consumed via THEME_COLOR).
   catData: 'var(--wf-cat-data)',
   catBlue: 'var(--wf-cat-blue)',

@@ -1515,18 +1515,22 @@ function GroupRow({ group, currentGroup, currentCommitId, currentRowRef, checkou
         const isCur = m.id === currentCommitId;
         const isHead = checkout && checkout.lastSha && m.sha === checkout.lastSha;
         const mark = memberFlagMark(m);
-        // In a same-file run (e.g. a code commit group) every member touches the
-        // file already named in the header, so repeating its path per row is
-        // noise — lead with the annotation's short title instead. When a member
-        // has no per-commit short title, fall back to the whole-group annotation
-        // (the group-level note the dossier labels "whole group"), prefixed with
-        // the file so the row still names what it touched: "<file>: <annotation>".
-        // Applies to same-file edit runs and to creation/deletion sequences alike.
-        // Only when neither a short title nor a group annotation exists do we drop
-        // to the plain path.
+        // In a same-file code commit group every member touches the file already
+        // named in the header, so repeating its path per row is noise — lead with
+        // the annotation's short title instead. When a member has no per-commit
+        // short title, fall back to the whole-group annotation (the group-level
+        // note the dossier labels "whole group"), prefixed with the file so the
+        // row still names what it touched: "<file>: <annotation>". This only earns
+        // its keep on code commit groups, where a same-file edit run's per-commit
+        // headline says more than the repeated path; data writes and deletion
+        // sequences keep their standard plain-filename label. Only when neither a
+        // short title nor a group annotation exists do we drop to the plain path.
+        const isCodeGroup = cls === 'code';
         const sameAsRoot = m.file && group.root && m.file === group.root;
-        const usesShortTitle = sameAsRoot && !!m.shortTitle;
-        const groupAnno = m.shortTitle ? '' : wholeGroupAnnotation(m, data?.annotationsByGroup);
+        const usesShortTitle = isCodeGroup && sameAsRoot && !!m.shortTitle;
+        const groupAnno = isCodeGroup && !m.shortTitle
+          ? wholeGroupAnnotation(m, data?.annotationsByGroup)
+          : '';
         const memberLabel = usesShortTitle
           ? m.shortTitle
           : groupAnno
@@ -4936,8 +4940,8 @@ export function ColoredDiffBody({ lines, maxHeight = 480, lineNumbers = false, g
           let bg;
           if (/^@@/.test(line)) { color = WF.tagBlueFg; bg = WF.tagBlueBg; }
           else if (/^Binary files /.test(line)) { color = WF.ink3; }
-          else if (/^\+/.test(line)) { color = WF.tagGreenFg; bg = WF.tagGreenBg; }
-          else if (/^-/.test(line)) { color = WF.heat4; bg = WF.tagRedBg; }
+          else if (/^\+/.test(line)) { color = WF.diffAddFg; bg = WF.tagGreenBg; }
+          else if (/^-/.test(line)) { color = WF.diffDelFg; bg = WF.tagRedBg; }
           const gap = gapAt && gapAt[i];
           const row = lineNumbers ? (
             <div key={i} style={{ display: 'flex', background: bg }}>
