@@ -1,11 +1,32 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import { spawn } from 'node:child_process';
+import { spawn, execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// App version stamped into the bundle as __APP_VERSION__, keyed to the UI repo's
+// current commit. It drives the settings-defaults migration in src/settings.jsx:
+// a `git pull` that advances HEAD reads as a new version, which is the trigger
+// for re-checking whether any setting's default changed (see reconcileSettings).
+// Evaluated once when the config loads — at dev-server start and at build time —
+// so a pull is picked up on the next `npm run dev` / `npm run build`. Falls back
+// to 'dev' when git isn't available (e.g. a built artifact deployed outside a
+// checkout); a constant version there simply means the migration never re-fires,
+// which is the safe degradation.
+function appVersion() {
+  try {
+    return execSync('git rev-parse --short HEAD', {
+      cwd: __dirname,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).toString().trim() || 'dev';
+  } catch {
+    return 'dev';
+  }
+}
+const APP_VERSION = appVersion();
 
 // Git context is served per-trace. A trace dropped into public/data/<name>/
 // mirrors the raw output layout (the whole `output/<trace>/` folder copied in
@@ -189,18 +210,23 @@ function listSupplemental(traceDir) {
 }
 
 // Loose docs sitting directly at the trace root that the results screen surfaces
-// under "Additional materials": any .md/.pdf/.txt file in the trace folder that
-// isn't already shown elsewhere on that screen. The skip set mirrors the fixed
-// root docs WireResults renders by name (the blue-team / process docs + the
-// package "other docs"), plus AI_AUDIT.md — the auditor's own exported
-// deliverable, commonly written back to the trace root, which the docs page
-// should not echo. Top level only (no recursion), so main_results/ and the
+// under "Additional materials": every markdown / image / .txt / PDF file in the
+// trace folder that isn't already shown by name elsewhere on that screen. There
+// is no content denylist — the only names dropped are the ones WireResults
+// already renders in their own sections, purely so a doc never appears twice
+// (de-dup, not hiding). AI_AUDIT.md, AI_AUDIT_backup.md and any other loose doc
+// therefore surface here. Top level only (no recursion), so main_results/ and the
 // reconstructed codebase stay out. Returns filenames relative to the trace root,
 // sorted; [] when the dir can't be read. Like listSupplemental, this rides along
 // in /data/index.json so it works the same in the dev server and a static build.
-const ROOT_DOC_EXTS = new Set(['md', 'pdf', 'txt']);
-const ROOT_DOCS_SKIP = new Set([
-  'ai_audit.md',                                              // the UI's own export deliverable
+const ROOT_DOC_IMG_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp', 'avif']; // mirrors IMG_EXTS in WireResults
+const ROOT_DOC_EXTS = new Set(['md', 'pdf', 'txt', ...ROOT_DOC_IMG_EXTS]);
+// Files already rendered by name in another section of the results screen, listed
+// here only so the catch-all doesn't echo them a second time. Mirrors the fixed
+// root-level docs in WireResults (OTHER_DOCS + the root-level STANDARD_DOCS). This
+// is strictly de-dup: it must never grow into a content filter — anything not
+// shown by name belongs in "Additional materials".
+const ROOT_DOCS_NAMED = new Set([
   'readme.md', 'claude.md', 'agents.md',                     // OTHER_DOCS in WireResults
   'blue_team_report.md',                                     // STANDARD_DOCS · Audit
   'experiment_description.md', 'guide_to_my_experiments.md', // STANDARD_DOCS · Process
@@ -215,7 +241,7 @@ function listRootDocs(traceDir) {
     if (!e.isFile() || e.name.startsWith('.')) continue;
     const ext = (e.name.split('.').pop() || '').toLowerCase();
     if (!ROOT_DOC_EXTS.has(ext)) continue;
-    if (ROOT_DOCS_SKIP.has(e.name.toLowerCase())) continue;
+    if (ROOT_DOCS_NAMED.has(e.name.toLowerCase())) continue;
     out.push(e.name);
   }
   out.sort((a, b) => a.localeCompare(b));
@@ -861,25 +887,34 @@ function checkoutMiddleware() {
       // `ord` is the commit's position in the full repo history (0 = newest)
       // so the UI can show how many commits sit between consecutive entries.
       //
-      // `--follow` is on so genuine renames are traced across path changes.
-      // It is unsafe here on its own: the repo seeds files as identical 0-byte
-      // placeholders, and `--follow`'s copy detection links any two empty
-      // blobs (100% identical), fabricating a chain that hops across unrelated
-      // files. We read `--raw` (which carries blob OIDs) and cut the follow at
-      // the first rename/copy whose *source* is the empty blob — never a real
-      // rename — recording that commit as the file's creation. With no genuine
-      // renames present this yields exactly the plain-log result; when a real
-      // rename appears (non-empty source) it is followed normally.
+      // Identity here is the EXACT PATH, with genuine renames as the only
+      // cross-path link. We deliberately do NOT use `git log --follow`: it makes
+      // one greedy content-similarity choice per birth, which (a) chases copies —
+      // the repo seeds files as identical empty placeholders and the researcher
+      // scaffolds new scripts by copy-pasting siblings, so a fresh file is
+      // reported as a *copy* of a still-present look-alike and the timeline hops
+      // into an unrelated file — and (b) skips a same-path instance that was
+      // deleted and later recreated under the same name (it follows the
+      // look-alike instead of showing this path's own earlier life).
       //
-      // `--follow` only traces renames *backward* from the name it is seeded
-      // with, so seeding it with the path as it exists at `sha` truncates the
-      // chain whenever `sha` sits before a rename: the post-rename commits live
-      // under a name `--follow` never reaches from the old one. So we first walk
-      // the file's identity forward (`latestPath`) to the name it carries at the
-      // newest commit of its lineage and seed the follow with *that* — yielding
-      // the full chain regardless of which side of a rename `sha` is on.
-      // `sha` only resolves the (experiment-relative) path against a tree and
-      // anchors the forward walk.
+      // Instead we name-match the exact path (`git log -- <path>`; rename
+      // detection on only to *label* changes, never `--follow`/`-C`), which
+      // yields that path's whole history — every create, modify, delete, and
+      // same-name recreate — and never crosses into a different file. Then we
+      // splice genuine renames back on: at the path's first appearance, consult
+      // the rename index (`pathEvents`, the unfiltered `--diff-filter=RD -M` map)
+      // for a rename *into* this path whose source blob is non-empty; if found,
+      // relabel that birth as the rename and prepend the source path's history,
+      // recursing through a chain of renames. A copy or a placeholder fill is
+      // never in that index, so it is never followed.
+      //
+      // Forward direction: a single-path name-match seeded with the path as it
+      // exists at `sha` would stop at a later rename-away. So we first walk the
+      // file's identity forward (`latestPath`) to the name it carries at the
+      // newest commit of its lineage and build the spine from *that* — giving the
+      // full chain regardless of which side of a rename `sha` is on. `sha` only
+      // resolves the (experiment-relative) path against a tree and anchors the
+      // forward walk.
       server.middlewares.use('/api/filelog', async (req, res) => {
         const url = new URL(req.url, 'http://x');
         const sha = url.searchParams.get('sha') || '';
@@ -895,56 +930,74 @@ function checkoutMiddleware() {
           res.statusCode = 409;
           return res.end(JSON.stringify({ error: 'ambiguous path', matches: resolved.matches }));
         }
-        // Follow forward to the lineage's newest name so `--follow` (which only
-        // traces renames backward) sees the whole chain, not just the part on
-        // `sha`'s side of a rename.
+        // Forward-follow genuine renames to the lineage's newest name, then
+        // build the timeline backward from there (see the comment above).
         const followPath = await latestPath(repo, sha, resolved.path);
-        // \x00 separates commits; \x1f separates header fields. `--raw -M`
-        // appends one `:<modes> <oldsha> <newsha> <STATUS>\t<path>[\t<newpath>]`
-        // line per file change, giving us the blob OIDs the guard needs.
-        const { code, stdout, stderr } = await runGit(repo, [
-          '-c', 'core.quotePath=false',
-          'log', '--all', '--follow', '--raw', '-M', '--abbrev=40',
-          '--format=%x00%H%x1f%cI%x1f%s',
-          '--', followPath,
-        ]);
-        if (code !== 0) {
-          res.statusCode = 500;
-          return res.end(JSON.stringify({ error: stderr.trim() || `git exit ${code}` }));
-        }
         const order = await commitOrder(repo);
-        const entries = [];
-        for (const rec of stdout.split('\0')) {
-          const block = rec.replace(/^\n+/, '');
-          if (!block.trim()) continue;
-          const nl = block.indexOf('\n');
-          const head = nl < 0 ? block : block.slice(0, nl);
-          const rest = nl < 0 ? '' : block.slice(nl + 1);
-          const parts = head.split('\x1f');
-          const h = parts[0];
-          if (!h) continue;
-          const date = parts[1] || '';
-          const subject = parts.slice(2).join('\x1f');
-          // First `:` raw line describes the change to the followed file.
-          const rawLine = rest.split('\n').find((l) => l.startsWith(':')) || '';
-          const segs = rawLine.replace(/^:/, '').split('\t');
-          const meta = segs[0].split(/\s+/);          // [oldmode,newmode,oldsha,newsha,STATUS]
-          const oldSha = meta[2] || '';
-          let status = (meta[4] || '').charAt(0) || 'M';
-          const paths = segs.slice(1);
-          const destPath = paths[paths.length - 1];
-          const fromPath = paths.length > 1 ? paths[0] : undefined;
-          const ord = order.has(h) ? order.get(h) : null;
+        const events = await pathEvents(repo);   // rename index, for the splice
 
-          // A rename/copy whose source is the empty blob is a placeholder
-          // artifact, not a real rename: this commit is where the file was
-          // first created (as an empty placeholder). Record it as an add and
-          // stop following before the chain hops into an unrelated file.
-          if ((status === 'C' || status === 'R') && oldSha === EMPTY_BLOB) {
-            entries.push({ sha: h, date, subject, status: 'A', ord });
-            break;
+        // Parse `git log --all --raw -M -- <path>` (NO --follow, NO -C) into a
+        // newest-first spine of every commit that touched that exact path. \x00
+        // separates commits, \x1f the header fields; the `:` raw line carries the
+        // A/M/D status. A rename shows up split — A on the new path, D on the old
+        // — because single-path pathspec filtering hides the counterpart, so the
+        // rename index (not this status) is what re-links the two sides below.
+        async function spineFor(targetPath) {
+          const r = await runGit(repo, [
+            '-c', 'core.quotePath=false',
+            'log', '--all', '--raw', '-M', '--abbrev=40',
+            '--format=%x00%H%x1f%cI%x1f%s',
+            '--', targetPath,
+          ]);
+          if (r.code !== 0) throw new Error(r.stderr.trim() || `git exit ${r.code}`);
+          const out = [];
+          for (const rec of r.stdout.split('\0')) {
+            const block = rec.replace(/^\n+/, '');
+            if (!block.trim()) continue;
+            const nl = block.indexOf('\n');
+            const head = nl < 0 ? block : block.slice(0, nl);
+            const rest = nl < 0 ? '' : block.slice(nl + 1);
+            const parts = head.split('\x1f');
+            const h = parts[0];
+            if (!h) continue;
+            const date = parts[1] || '';
+            const subject = parts.slice(2).join('\x1f');
+            const rawLine = rest.split('\n').find((l) => l.startsWith(':')) || '';
+            const meta = rawLine.replace(/^:/, '').split('\t')[0].split(/\s+/);
+            const status = (meta[4] || '').charAt(0) || 'M';   // [omode,nmode,osha,nsha,STATUS]
+            const ord = order.has(h) ? order.get(h) : null;
+            out.push({ sha: h, date, subject, status, ord });
           }
-          entries.push({ sha: h, date, subject, status, from: fromPath, ord });
+          return out;
+        }
+
+        let entries;
+        try {
+          entries = await spineFor(followPath);
+          // Splice genuine renames onto the OLDEST end. At the path's first
+          // appearance, look for a rename *into* the current path at that same
+          // commit whose source blob is non-empty — a real rename, not a
+          // placeholder fill or a copy (copies aren't in the index at all).
+          // Relabel that birth as the rename and prepend the source path's
+          // history, dropping the twin delete the same commit shows on the old
+          // path. Recurse through a chain of renames; `visited` stops cycles.
+          let current = followPath;
+          const visited = new Set([current]);
+          while (entries.length) {
+            const birth = entries[entries.length - 1];
+            const rn = events.find((e) =>
+              e.type === 'R' && e.to === current && e.ord === birth.ord && e.oldSha !== EMPTY_BLOB);
+            if (!rn || visited.has(rn.from)) break;
+            birth.status = 'R';
+            birth.from = rn.from;
+            const seg = (await spineFor(rn.from)).filter((e) => e.sha !== birth.sha);
+            entries = entries.concat(seg);
+            current = rn.from;
+            visited.add(current);
+          }
+        } catch (err) {
+          res.statusCode = 500;
+          return res.end(JSON.stringify({ error: err.message || String(err) }));
         }
         res.end(JSON.stringify({ path: followPath, entries }));
       });
@@ -954,6 +1007,12 @@ function checkoutMiddleware() {
 
 export default defineConfig({
   plugins: [react(), checkoutMiddleware()],
+  // Bake the UI repo's commit in as __APP_VERSION__ so the client can detect a
+  // new version on launch and migrate settings defaults — see appVersion above
+  // and src/settings.jsx.
+  define: {
+    __APP_VERSION__: JSON.stringify(APP_VERSION),
+  },
   server: {
     port: 5173,
     open: false,

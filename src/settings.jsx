@@ -15,6 +15,20 @@ import { logActivity } from './activityLog.js';
 import { SessionTimer } from './SessionTimer.jsx';
 
 const SETTINGS_KEY = 'redlogs:settings';
+// Sidecar to the settings blob recording, from the last launch, (1) the app
+// version we last reconciled against and (2) a snapshot of the DEFAULTS in force
+// then. Kept in its own key so it never rides along in the settings object the
+// toggles read/write. Drives the new-version defaults migration in
+// loadSettings(): when the build's version differs from the recorded one, we
+// diff this snapshot against the live DEFAULTS and let any NEW or CHANGED default
+// take effect, leaving unchanged-default settings as the auditor left them.
+const SETTINGS_META_KEY = 'redlogs:settings-meta';
+
+// The build version, stamped in by vite's `define` from the UI repo's HEAD (see
+// vite.config.js → appVersion). A `git pull` that advances HEAD changes this,
+// which is what flags "new version" on the next launch. `typeof` guards the case
+// where define didn't run (a bare import / test) so the reference can't throw.
+const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : 'dev';
 // `inboxSubline` chooses what the greyed secondary line under each inbox row
 // shows: 'operation' (the raw audit op, e.g. "modified (MOVE_TO)" — the
 // default), 'shortTitle' (the annotation agent's <=10-word headline, if any),
@@ -138,19 +152,100 @@ export const INBOX_SUBLINE_OPTIONS = [
   { value: 'none', label: 'none', hint: 'hide the line' },
 ];
 
-function loadSettings() {
-  try {
-    const raw = localStorage.getItem(SETTINGS_KEY);
-    const o = raw ? JSON.parse(raw) : {};
-    const merged = { ...DEFAULTS, ...(o && typeof o === 'object' ? o : {}) };
-    // paneWidths is nested, so a stored partial (older shape, or one pane ever
-    // dragged) must deep-merge onto the defaults — a shallow spread would drop
-    // the panes the user never touched.
-    merged.paneWidths = { ...PANE_DEFAULTS, ...(o && typeof o.paneWidths === 'object' ? o.paneWidths : {}) };
-    return merged;
-  } catch {
-    return { ...DEFAULTS };
+const isObj = (v) => v != null && typeof v === 'object' && !Array.isArray(v);
+
+// A deep, JSON-safe clone of the current defaults, stored in the meta sidecar so
+// the next launch can tell which defaults changed. DEFAULTS only holds
+// booleans / strings / the flat paneWidths object, so the JSON round-trip is exact.
+const snapshotDefaults = () => JSON.parse(JSON.stringify(DEFAULTS));
+
+// Normal load-time merge: defaults supply every key, the stored value wins for
+// each one the auditor has (so customizations survive), and nested paneWidths is
+// deep-merged so panes never dragged keep their default width. This is the
+// same-version / first-run path — nothing is forced.
+function mergeWithDefaults(stored) {
+  const merged = { ...DEFAULTS, ...stored };
+  merged.paneWidths = { ...PANE_DEFAULTS, ...(isObj(stored.paneWidths) ? stored.paneWidths : {}) };
+  return merged;
+}
+
+// Reconcile one setting on a version bump. The rule: a default that is NEW
+// (absent from the old snapshot) or CHANGED (old default ≠ new default) takes
+// effect, overriding whatever is stored; a default that is UNCHANGED leaves the
+// stored value alone, so the auditor's customizations persist. So with old
+// defaults {A:true, B:true, C:false} and new {A:true, B:false, C:false, D:true},
+// only B (changed) and D (new) are written — A and C keep the auditor's value.
+// Nested objects (paneWidths) recurse so the rule applies per sub-key: bumping
+// one pane's default width doesn't disturb panes the auditor has resized.
+function reconcileValue(stored, oldDefault, newDefault, hadStored) {
+  if (isObj(newDefault) && isObj(oldDefault)) {
+    const base = isObj(stored) ? stored : {};
+    const out = { ...base };
+    for (const k of Object.keys(newDefault)) {
+      out[k] = reconcileValue(base[k], oldDefault[k], newDefault[k],
+        Object.prototype.hasOwnProperty.call(base, k));
+    }
+    return out;
   }
+  const isNew = oldDefault === undefined;     // default didn't exist last version
+  const changed = oldDefault !== newDefault;  // default value moved between versions
+  if (isNew || changed) return newDefault;    // new or changed default wins
+  return hadStored ? stored : newDefault;     // unchanged default → keep the auditor's value
+}
+
+// Apply the rule across every default key, starting from the stored settings so
+// unknown keys the auditor still carries are preserved (same as the plain merge).
+function reconcileSettings(stored, oldDefaults) {
+  const out = { ...stored };
+  for (const key of Object.keys(DEFAULTS)) {
+    out[key] = reconcileValue(stored[key], oldDefaults[key], DEFAULTS[key],
+      Object.prototype.hasOwnProperty.call(stored, key));
+  }
+  return out;
+}
+
+function loadMeta() {
+  try {
+    const m = JSON.parse(localStorage.getItem(SETTINGS_META_KEY));
+    return isObj(m) ? m : null;
+  } catch {
+    return null;
+  }
+}
+
+// Load persisted settings, running the new-version defaults migration first. We
+// compare the build's version (the UI repo's commit) against the version recorded
+// the last time settings were reconciled:
+//   • first run / no meta — adopt the current build as the baseline and merge
+//     normally, so an existing auditor's settings are left untouched. (We can't
+//     migrate across a gap we have no snapshot for; future bumps migrate cleanly.)
+//   • same version — nothing changed; merge normally.
+//   • new version — diff the stored defaults snapshot against the live DEFAULTS
+//     and let every NEW or CHANGED default take effect (reconcileSettings).
+// Whatever we resolve is written straight back, with a refreshed meta, so adopted
+// defaults stick and the migration fires once per version. Doing this in the
+// state initializer keeps it atomic with the read; it's idempotent, so React 18
+// StrictMode's double-invoke is harmless.
+function loadSettings() {
+  let stored = {};
+  try {
+    const o = JSON.parse(localStorage.getItem(SETTINGS_KEY));
+    if (isObj(o)) stored = o;
+  } catch { /* corrupt / absent — treat as empty, fall back to defaults below */ }
+
+  const meta = loadMeta();
+  const newVersion = !!meta && meta.version !== APP_VERSION && isObj(meta.defaults);
+  const result = newVersion ? reconcileSettings(stored, meta.defaults) : mergeWithDefaults(stored);
+  // Guarantee a fresh paneWidths object carrying every pane key (never the shared
+  // PANE_DEFAULTS reference). mergeWithDefaults already does this; for the
+  // reconcile path it backfills any pane key a stale snapshot lacked.
+  result.paneWidths = { ...PANE_DEFAULTS, ...(isObj(result.paneWidths) ? result.paneWidths : {}) };
+
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(result));
+    localStorage.setItem(SETTINGS_META_KEY, JSON.stringify({ version: APP_VERSION, defaults: snapshotDefaults() }));
+  } catch { /* quota / disabled storage — in-memory result still applies */ }
+  return result;
 }
 
 const SettingsContext = React.createContext(null);

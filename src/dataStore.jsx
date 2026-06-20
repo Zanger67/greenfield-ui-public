@@ -56,6 +56,42 @@ const MANIFEST_URL = '/data/index.json';
 const AUDIT_URL = '/api/audit';
 const dataUrl = (name, file) => `/data/${name}/${file}`;
 
+// How often a long-open tab revalidates the trace list against the dev server.
+// The server synthesizes /data/index.json from disk on every request, so a trace
+// dropped in (or a doc added to one) only reaches an already-open UI if we poll.
+const MANIFEST_POLL_MS = 20000;
+
+// Normalise one /data/index.json into the inputs list. Carries EVERY field the
+// screens read off a trace — name/label/source plus the per-trace file listings
+// (supplemental_materials/ via `supplemental`, and the loose root docs via
+// `rootDocs`, which WireResults surfaces under "Additional materials"). Add a
+// field here whenever the server manifest grows one, or it's silently dropped and
+// currentTrace never sees it.
+function normaliseManifest(json) {
+  const list = Array.isArray(json?.inputs) ? json.inputs : [];
+  return list.map((it) => (typeof it === 'string'
+    ? { name: it, label: it, source: 'public/data', supplemental: [], rootDocs: [] }
+    : {
+      name: it.name,
+      label: it.label || it.name,
+      source: it.source || 'public/data',
+      supplemental: Array.isArray(it.supplemental) ? it.supplemental : [],
+      rootDocs: Array.isArray(it.rootDocs) ? it.rootDocs : [],
+    }));
+}
+
+// Fetch + normalise the manifest, always revalidating (cache:'no-store') so the
+// periodic poll and post-reset refresh can't be served a stale browser cache.
+function fetchManifest() {
+  return fetch(MANIFEST_URL, { cache: 'no-store' })
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`manifest ${r.status}`))))
+    .then(normaliseManifest);
+}
+
+// Cheap structural equality so a revalidation that found nothing new keeps the
+// previous array identity — no needless re-render or downstream effect churn.
+const sameManifest = (a, b) => a.length === b.length && JSON.stringify(a) === JSON.stringify(b);
+
 // Auditor markups (visited / user-flagged / notes / user groups) persist
 // per-trace in localStorage so they survive trace swaps, hard reloads, and tab
 // close. Keyed by trace name; position lives in history.state, markups live
@@ -848,24 +884,14 @@ export function DataProvider({ children }) {
   // See withSuspicionGate / withDeterministicFlagGate.
   const { showAiSuspicion, showDeterministicFlags } = useSettings();
 
-  // Manifest discovery.
+  // Manifest discovery — the initial load, which also restores the saved/last
+  // position. Runs once on UI start; the live-revalidation effect below keeps the
+  // list fresh thereafter without disturbing the selection.
   React.useEffect(() => {
     let cancelled = false;
-    fetch(MANIFEST_URL)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`manifest ${r.status}`))))
-      .then((json) => {
+    fetchManifest()
+      .then((normalised) => {
         if (cancelled) return;
-        const list = Array.isArray(json?.inputs) ? json.inputs : [];
-        const normalised = list.map((it) => (typeof it === 'string'
-          ? { name: it, label: it, source: 'public/data', supplemental: [] }
-          : {
-            name: it.name,
-            label: it.label || it.name,
-            source: it.source || 'public/data',
-            // Files under the trace's supplemental_materials/ (see vite.config's
-            // listSupplemental); the results screen lists + opens them.
-            supplemental: Array.isArray(it.supplemental) ? it.supplemental : [],
-          }));
         setInputs(normalised);
         if (normalised.length === 0) return;
         // Restore priority, narrowest match first:
@@ -897,6 +923,33 @@ export function DataProvider({ children }) {
         if (!cancelled) setState({ status: 'error', error: `manifest: ${err.message}`, data: null });
       });
     return () => { cancelled = true; };
+  }, []);
+
+  // Keep the trace list live after the initial load. The dev server rebuilds
+  // /data/index.json from disk on every request, so a trace dropped in — or a doc
+  // added to one (e.g. a new root-level AI_AUDIT.md) — only reaches an already-open
+  // tab if we re-poll. Revalidate periodically, when the tab regains focus, and
+  // whenever the auditor resets the cache. We only swap the list when it actually
+  // changed (sameManifest keeps the old identity otherwise) and never touch the
+  // selection — a background refresh must not yank the auditor off their open
+  // trace. Failures are swallowed: a momentary dev-server blip keeps the last list.
+  React.useEffect(() => {
+    let cancelled = false;
+    const revalidate = () => fetchManifest()
+      .then((next) => {
+        if (cancelled) return;
+        setInputs((prev) => (sameManifest(prev, next) ? prev : next));
+      })
+      .catch(() => { /* offline / server restarting — keep the current list */ });
+    const id = setInterval(revalidate, MANIFEST_POLL_MS);
+    window.addEventListener('redlogs:reset-cache', revalidate);
+    window.addEventListener('focus', revalidate);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+      window.removeEventListener('redlogs:reset-cache', revalidate);
+      window.removeEventListener('focus', revalidate);
+    };
   }, []);
 
   // Per-input load — reset user overlays since they belonged to the previous
