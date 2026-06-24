@@ -311,6 +311,21 @@ function parseDiffPaths(raw) {
   return paths;
 }
 
+// Read a POST request's JSON body. Resolves the parsed object ({} when empty),
+// or null on malformed JSON so the caller can 400. The diff endpoints use this
+// to carry a large `paths` list in the body instead of the query string — a
+// 100+ file pathspec overflows Node's request-line/header limit (HTTP 431).
+function readJsonBody(req) {
+  return new Promise((resolve) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      if (!body) return resolve({});
+      try { resolve(JSON.parse(body)); } catch { resolve(null); }
+    });
+  });
+}
+
 function runGit(repo, args) {
   return new Promise((resolve) => {
     if (!repo) return resolve({ code: -1, stdout: '', stderr: 'no reconstruction repo for this input' });
@@ -747,17 +762,26 @@ function checkoutMiddleware() {
         res.end(stderr || `git exit ${code}`);
       });
 
-      // GET /api/diff?sha=<sha>&name=<input>[&paths=<a\nb>] → text of
+      // GET  /api/diff?sha=<sha>&name=<input>[&paths=<a\nb>] → text of
       // `git show <sha>` (commit header + patch). With `paths` (newline-joined,
       // URL-encoded) the patch is restricted to those files — used to batch-fetch
       // just the small files' bodies after a /api/diffstat pass, so the heavy
       // ones are never sent until the auditor opens them.
+      // POST /api/diff?sha=<sha>&name=<input>  body { paths: [<a>, <b>, …] } —
+      // same restriction, but the path list rides in the body so a 100+ file
+      // commit doesn't overflow the URL/header limit (HTTP 431).
       server.middlewares.use('/api/diff', async (req, res) => {
         const url = new URL(req.url, 'http://x');
         const sha = url.searchParams.get('sha') || '';
         const repo = resolveRepo(url.searchParams.get('name'));
         if (!SHA_RE.test(sha)) { res.statusCode = 400; return res.end('bad sha'); }
-        const paths = parseDiffPaths(url.searchParams.get('paths'));
+        let rawPaths = url.searchParams.get('paths');
+        if (req.method === 'POST') {
+          const body = await readJsonBody(req);
+          if (body === null) { res.statusCode = 400; return res.end('bad json'); }
+          if (Array.isArray(body.paths)) rawPaths = body.paths.join('\n');
+        }
+        const paths = parseDiffPaths(rawPaths);
         if (paths === null) { res.statusCode = 400; return res.end('bad paths'); }
         const args = ['show', '--no-color', '--format=fuller', '--stat', '--patch', sha];
         if (paths.length) args.push('--', ...paths);
@@ -777,7 +801,9 @@ function checkoutMiddleware() {
       // `git diff <from>~1 <to>`, where `from` is the group's oldest commit and
       // `to` its newest. The group is a contiguous run of the linear history,
       // so this is the net change across every commit under the group. Falls
-      // back to the empty tree as base when `from` is the root commit.
+      // back to the empty tree as base when `from` is the root commit. Accepts a
+      // `paths` restriction via query (GET) or `{ paths: [...] }` body (POST),
+      // the latter for path lists too large to fit the URL (HTTP 431).
       server.middlewares.use('/api/groupdiff', async (req, res) => {
         const url = new URL(req.url, 'http://x');
         const from = url.searchParams.get('from') || '';
@@ -785,7 +811,13 @@ function checkoutMiddleware() {
         const repo = resolveRepo(url.searchParams.get('name'));
         res.setHeader('content-type', 'text/plain; charset=utf-8');
         if (!SHA_RE.test(from) || !SHA_RE.test(to)) { res.statusCode = 400; return res.end('bad sha'); }
-        const paths = parseDiffPaths(url.searchParams.get('paths'));
+        let rawPaths = url.searchParams.get('paths');
+        if (req.method === 'POST') {
+          const body = await readJsonBody(req);
+          if (body === null) { res.statusCode = 400; return res.end('bad json'); }
+          if (Array.isArray(body.paths)) rawPaths = body.paths.join('\n');
+        }
+        const paths = parseDiffPaths(rawPaths);
         if (paths === null) { res.statusCode = 400; return res.end('bad paths'); }
         const diffArgs = (base) => {
           const a = ['diff', '--no-color', '--stat', '--patch', base, to];

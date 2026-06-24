@@ -3817,7 +3817,7 @@ export const bigLinesFor = (path) =>
 //   1. /api/diffstat → every file's path + added/deleted counts (numstat), no
 //      bodies. Files over their per-class big threshold (bigLinesFor) stay
 //      collapsed — data artifacts at 350 changed lines, source/prose at 500.
-//   2. /api/diff?paths=… → the bodies of just the small files, in one git call.
+//   2. POST /api/diff {paths:[…]} → bodies of just the small files, one git call.
 // A large file's body is fetched only if the auditor opens it (FileDiff /
 // LogDiffRow load it on demand via /api/filediff). mergeStatBodies rebuilds the
 // exact {commitMessage, logs, other} shape parseDiff returns, so every renderer
@@ -3898,8 +3898,8 @@ function mergeStatBodies(stat, bodyByPath) {
   };
 }
 
-async function fetchDiffText(url) {
-  const r = await fetch(url);
+async function fetchDiffText(url, opts) {
+  const r = await fetch(url, opts);
   const text = await r.text();
   if (!r.ok) throw new Error(text || `HTTP ${r.status}`);
   return text;
@@ -3907,12 +3907,18 @@ async function fetchDiffText(url) {
 
 // Bodies of the small files only, via one batched /api/diff (or /api/groupdiff)
 // restricted to their paths. `bodyUrl` already carries the sha/range + name.
+// The path list is POSTed in the body, not appended to the URL: a commit
+// touching 100+ files overflows Node's request-line/header limit and the dev
+// server rejects it with HTTP 431 before the middleware ever runs.
 async function fetchSmallBodies(stat, bodyUrl) {
   const small = stat.files.filter((s) => !s.isBinary && statTotal(s) <= bigLinesFor(s.path));
   const byPath = new Map();
   if (!small.length) return byPath;
-  const paths = encodeURIComponent(small.map((s) => s.path).join('\n'));
-  const parsed = parseDiff(await fetchDiffText(`${bodyUrl}&paths=${paths}`));
+  const parsed = parseDiff(await fetchDiffText(bodyUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ paths: small.map((s) => s.path) }),
+  }));
   for (const f of [...parsed.other, ...parsed.logs]) byPath.set(f.path, f);
   return byPath;
 }
